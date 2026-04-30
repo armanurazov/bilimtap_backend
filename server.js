@@ -45,7 +45,7 @@ const app = express();
 app.use(helmet());
 
 app.use(cors({
-  origin: process.env.NODE_ENV === 'production' ? ALLOWED_ORIGIN : '*',
+  origin: true,
   methods: ['POST', 'GET'],
   allowedHeaders: ['Content-Type'],
 }));
