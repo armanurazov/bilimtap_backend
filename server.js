@@ -3,6 +3,7 @@
 // ============================================================
 // BILIMTAP — Validation Campaign Backend
 // Single-file Express server
+// Receives events from frontend → writes to Supabase
 // ============================================================
 // Setup:
 //   npm install express @supabase/supabase-js cors helmet
@@ -10,7 +11,7 @@
 // Required environment variables (set in Railway dashboard):
 //   SUPABASE_URL      — from Supabase project settings
 //   SUPABASE_KEY      — service_role key (not anon key)
-//   ALLOWED_ORIGIN    — your Vercel frontend URL
+//   ALLOWED_ORIGIN    — your Vercel frontend URL e.g. https://bilimtap.vercel.app
 //   PORT              — Railway sets this automatically
 // ============================================================
 
@@ -18,6 +19,7 @@ const express    = require('express');
 const cors       = require('cors');
 const helmet     = require('helmet');
 const { createClient } = require('@supabase/supabase-js');
+require('dotenv').config();
 
 // ─── ENV VALIDATION ─────────────────────────────────────────
 const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_KEY', 'ALLOWED_ORIGIN'];
@@ -43,20 +45,22 @@ const app = express();
 app.use(helmet());
 
 app.use(cors({
-  origin: process.env.NODE_ENV === 'production' ? ALLOWED_ORIGIN : '*',
+  origin: true,
   methods: ['POST', 'GET'],
   allowedHeaders: ['Content-Type'],
 }));
 
-app.use(express.json({ limit: '32kb' }));
+app.use(express.json({ limit: '16kb' }));
 
 // ─── HELPERS ────────────────────────────────────────────────
+
 function parseDevice(ua = '') {
   ua = ua.toLowerCase();
   if (/ipad|tablet|playbook|silk/.test(ua))             return 'tablet';
   if (/mobile|iphone|ipod|android|blackberry/.test(ua)) return 'mobile';
   return 'desktop';
 }
+
 function parseBrowser(ua = '') {
   ua = ua.toLowerCase();
   if (ua.includes('edg/'))    return 'edge';
@@ -66,6 +70,7 @@ function parseBrowser(ua = '') {
   if (ua.includes('safari'))  return 'safari';
   return 'other';
 }
+
 function parseOS(ua = '') {
   ua = ua.toLowerCase();
   if (ua.includes('iphone') || ua.includes('ipad')) return 'ios';
@@ -75,13 +80,19 @@ function parseOS(ua = '') {
   if (ua.includes('linux'))    return 'linux';
   return 'other';
 }
+
 function isValidText(val, max = 500) {
   return typeof val === 'string' && val.trim().length > 0 && val.length <= max;
 }
 
 const VALID_EVENTS = new Set([
-  'page_view', 'course_card_click', 'modal_open',
-  'modal_close', 'form_start', 'form_submit', 'page_exit',
+  'page_view',
+  'course_card_click',
+  'modal_open',
+  'modal_close',
+  'form_start',
+  'form_submit',
+  'page_exit',
 ]);
 
 const VALID_PROFESSIONS = new Set([
@@ -101,9 +112,18 @@ app.get('/health', (_req, res) => {
 // ── POST /session ────────────────────────────────────────────
 app.post('/session', async (req, res) => {
   const {
-    session_id, visitor_id,
-    utm_source, utm_medium, utm_campaign, utm_content, utm_term,
-    referrer, landing_url, screen_width, language, is_bot,
+    session_id,
+    visitor_id,
+    utm_source,
+    utm_medium,
+    utm_campaign,
+    utm_content,
+    utm_term,
+    referrer,
+    landing_url,
+    screen_width,
+    language,
+    is_bot,
   } = req.body;
 
   if (!isValidText(session_id, 100) || !isValidText(visitor_id, 100)) {
@@ -127,32 +147,44 @@ app.post('/session', async (req, res) => {
       utm_term:     utm_term     || null,
       referrer:     referrer     || null,
       landing_url:  landing_url  || null,
-      device_type, browser, os,
+      device_type,
+      browser,
+      os,
       screen_width: Number.isInteger(screen_width) ? screen_width : null,
       language:     language     || null,
       is_bot:       is_bot === true,
     }, { onConflict: 'session_id' });
 
   if (error) {
-    console.error('[/session]', error.message);
+    console.error('[/session] Supabase error:', error.message);
     return res.status(500).json({ error: 'Failed to create session' });
   }
+
   res.json({ ok: true });
 });
 
 // ── POST /event ──────────────────────────────────────────────
 app.post('/event', async (req, res) => {
-  const { session_id, visitor_id, event_type, course_id, metadata, time_on_page_ms } = req.body;
+  const {
+    session_id,
+    visitor_id,
+    event_type,
+    course_id,
+    metadata,
+    time_on_page_ms,
+  } = req.body;
 
   if (!isValidText(session_id, 100) || !isValidText(visitor_id, 100)) {
     return res.status(400).json({ error: 'session_id and visitor_id are required' });
   }
+
   if (!VALID_EVENTS.has(event_type)) {
     return res.status(400).json({ error: `Invalid event_type: ${event_type}` });
   }
 
   const safeMeta = (metadata && typeof metadata === 'object' && !Array.isArray(metadata))
-    ? metadata : null;
+    ? metadata
+    : null;
 
   const { error: eventError } = await supabase
     .from('bilimtap_events')
@@ -166,36 +198,47 @@ app.post('/event', async (req, res) => {
     });
 
   if (eventError) {
-    console.error('[/event]', eventError.message);
+    console.error('[/event] Supabase insert error:', eventError.message);
     return res.status(500).json({ error: 'Failed to record event' });
   }
 
-  // Update session booleans — best effort
-  const updates = {};
-  if (event_type === 'course_card_click') updates.did_click_card  = true;
-  if (event_type === 'modal_open')        updates.did_open_modal  = true;
-  if (event_type === 'form_start')        updates.did_start_form  = true;
-  if (event_type === 'form_submit')       updates.did_submit_form = true;
+  const sessionUpdates = {};
+  if (event_type === 'course_card_click') sessionUpdates.did_click_card  = true;
+  if (event_type === 'modal_open')        sessionUpdates.did_open_modal  = true;
+  if (event_type === 'form_start')        sessionUpdates.did_start_form  = true;
+  if (event_type === 'form_submit')       sessionUpdates.did_submit_form = true;
 
-  if (Object.keys(updates).length > 0) {
-    updates.last_seen_at = new Date().toISOString();
-    await supabase
+  if (Object.keys(sessionUpdates).length > 0) {
+    sessionUpdates.last_seen_at = new Date().toISOString();
+    const { error: sessionError } = await supabase
       .from('bilimtap_sessions')
-      .update(updates)
+      .update(sessionUpdates)
       .eq('session_id', session_id.trim());
+
+    if (sessionError) {
+      console.warn('[/event] Session update warning:', sessionError.message);
+    }
   }
 
   res.json({ ok: true });
 });
 
 // ── POST /submit ─────────────────────────────────────────────
-// Course pre-registration form
 app.post('/submit', async (req, res) => {
-  const { session_id, visitor_id, phone, email, name, course_id, time_on_page_ms } = req.body;
+  const {
+    session_id,
+    visitor_id,
+    phone,
+    email,
+    name,
+    course_id,
+    time_on_page_ms,
+  } = req.body;
 
   if (!isValidText(session_id, 100) || !isValidText(visitor_id, 100)) {
     return res.status(400).json({ error: 'session_id and visitor_id are required' });
   }
+
   if (!isValidText(course_id, 100)) {
     return res.status(400).json({ error: 'course_id is required' });
   }
@@ -227,19 +270,20 @@ app.post('/submit', async (req, res) => {
     });
 
   if (submitError) {
-    console.error('[/submit]', submitError.message);
+    console.error('[/submit] Supabase insert error:', submitError.message);
     return res.status(500).json({ error: 'Failed to save submission' });
   }
 
-  // Mirror as event
-  await supabase.from('bilimtap_events').insert({
-    session_id:      session_id.trim(),
-    visitor_id:      visitor_id.trim(),
-    event_type:      'form_submit',
-    course_id:       course_id.trim(),
-    metadata:        { has_phone: hasPhone, has_email: hasEmail, is_duplicate },
-    time_on_page_ms: Number.isInteger(time_on_page_ms) ? time_on_page_ms : null,
-  });
+  await supabase
+    .from('bilimtap_events')
+    .insert({
+      session_id:      session_id.trim(),
+      visitor_id:      visitor_id.trim(),
+      event_type:      'form_submit',
+      course_id:       course_id.trim(),
+      metadata:        { has_phone: hasPhone, has_email: hasEmail, is_duplicate },
+      time_on_page_ms: Number.isInteger(time_on_page_ms) ? time_on_page_ms : null,
+    });
 
   await supabase
     .from('bilimtap_sessions')
@@ -250,7 +294,7 @@ app.post('/submit', async (req, res) => {
 });
 
 // ── POST /tutor ───────────────────────────────────────────────
-// Tutor application form — NEW
+// Tutor application form submissions
 app.post('/tutor', async (req, res) => {
   const {
     name,
@@ -262,7 +306,6 @@ app.post('/tutor', async (req, res) => {
     about,
   } = req.body;
 
-  // Required field validation
   if (!isValidText(name, 200)) {
     return res.status(400).json({ error: 'name is required' });
   }
@@ -296,14 +339,14 @@ app.post('/tutor', async (req, res) => {
     });
 
   if (error) {
-    console.error('[/tutor]', error.message);
+    console.error('[/tutor] Supabase insert error:', error.message);
     return res.status(500).json({ error: 'Failed to save tutor application' });
   }
 
   res.json({ ok: true });
 });
 
-// ─── 404 ─────────────────────────────────────────────────────
+// ─── 404 CATCH-ALL ───────────────────────────────────────────
 app.use((_req, res) => {
   res.status(404).json({ error: 'Not found' });
 });
