@@ -230,6 +230,64 @@ app.post('/event', async (req, res) => {
   res.json({ ok: true });
 });
 
+
+
+// ── POST /tutor ───────────────────────────────────────────────
+// Tutor application form — NEW
+app.post('/tutor', async (req, res) => {
+  const {
+    name,
+    phone,
+    email,
+    profession,
+    experience_years,
+    course_idea,
+    about,
+  } = req.body;
+ 
+  // Required field validation
+  if (!isValidText(name, 200)) {
+    return res.status(400).json({ error: 'name is required' });
+  }
+  if (!isValidText(phone, 30)) {
+    return res.status(400).json({ error: 'phone is required' });
+  }
+  if (!VALID_PROFESSIONS.has(profession)) {
+    return res.status(400).json({ error: 'Invalid profession value' });
+  }
+  if (!VALID_EXPERIENCE.has(experience_years)) {
+    return res.status(400).json({ error: 'Invalid experience_years value' });
+  }
+  if (!isValidText(course_idea, 500)) {
+    return res.status(400).json({ error: 'course_idea is required' });
+  }
+  if (!isValidText(about, 2000)) {
+    return res.status(400).json({ error: 'about is required' });
+  }
+ 
+  const { error } = await supabase
+    .from('bilimtap_tutor_applications')
+    .insert({
+      name:             name.trim(),
+      phone:            phone.trim(),
+      email:            isValidText(email, 200) ? email.trim().toLowerCase() : null,
+      profession,
+      experience_years,
+      course_idea:      course_idea.trim(),
+      about:            about.trim(),
+      status:           'new',
+    });
+ 
+  if (error) {
+    console.error('[/tutor]', error.message);
+    return res.status(500).json({ error: 'Failed to save tutor application' });
+  }
+ 
+  res.json({ ok: true });
+});
+
+
+
 // ── POST /submit ─────────────────────────────────────────────
 // Called when user submits the pre-registration form.
 // Writes to bilimtap_submissions (clean leads table).
