@@ -1,17 +1,22 @@
 'use strict';
 
 // ============================================================
-// BILIMTAP — Validation Campaign Backend
+// BILIMTAP — Backend Server
 // Single-file Express server
-// Receives events from frontend → writes to Supabase
-// ============================================================
+//
+// Contains two feature sets:
+//   1. BilimTap Validation Campaign  (original)
+//   2. IELTS Prep Platform           (added below, clearly separated)
+//
+// Shared Supabase project & environment variables.
+//
 // Setup:
 //   npm install express @supabase/supabase-js cors helmet
 //
 // Required environment variables (set in Railway dashboard):
 //   SUPABASE_URL      — from Supabase project settings
 //   SUPABASE_KEY      — service_role key (not anon key)
-//   ALLOWED_ORIGIN    — your Vercel frontend URL e.g. https://bilimtap.vercel.app
+//   ALLOWED_ORIGIN    — your frontend URL e.g. https://bilimtap.vercel.app
 //   PORT              — Railway sets this automatically
 // ============================================================
 
@@ -52,7 +57,10 @@ app.use(cors({
 
 app.use(express.json({ limit: '16kb' }));
 
-// ─── HELPERS ────────────────────────────────────────────────
+
+// ============================================================
+// HELPERS — BILIMTAP (original)
+// ============================================================
 
 function parseDevice(ua = '') {
   ua = ua.toLowerCase();
@@ -102,7 +110,10 @@ const VALID_PROFESSIONS = new Set([
 
 const VALID_EXPERIENCE = new Set(['less-1', '1-3', '3-5', '5-plus']);
 
-// ─── ROUTES ─────────────────────────────────────────────────
+
+// ============================================================
+// ROUTES — BILIMTAP (original, unchanged)
+// ============================================================
 
 // Health check
 app.get('/health', (_req, res) => {
@@ -294,7 +305,6 @@ app.post('/submit', async (req, res) => {
 });
 
 // ── POST /tutor ───────────────────────────────────────────────
-// Tutor application form submissions
 app.post('/tutor', async (req, res) => {
   const {
     name,
@@ -346,13 +356,278 @@ app.post('/tutor', async (req, res) => {
   res.json({ ok: true });
 });
 
-// ─── 404 CATCH-ALL ───────────────────────────────────────────
+
+// ============================================================
+// ============================================================
+//
+//   IELTS PREP PLATFORM — Endpoints
+//   Tables used (all in the same Supabase project):
+//     ielts_sessions        — one row per browser session
+//     ielts_events          — one row per user interaction
+//     block1_questions      — task content for Block 1, one row per day
+//     block2_questions      — task content for Block 2, one row per day
+//     block3_questions      — task content for Block 3, one row per day
+//     answers               — all student answers across all blocks
+//
+//   All routes are prefixed with /api/ to avoid collisions
+//   with the existing BilimTap routes above.
+//
+// ============================================================
+// ============================================================
+
+// ── HELPERS — IELTS ─────────────────────────────────────────
+
+/**
+ * Parses and validates the block query param.
+ * Returns integer 1-3, or null if invalid.
+ */
+function parseBlock(raw) {
+  const b = parseInt(raw, 10);
+  return (b >= 1 && b <= 3) ? b : null;
+}
+
+/**
+ * Parses and validates a positive integer day param.
+ * Returns integer >= 1, or null if invalid.
+ */
+function parseDay(raw) {
+  const d = parseInt(raw, 10);
+  return (Number.isFinite(d) && d >= 1) ? d : null;
+}
+
+// Valid block table names — used as an allowlist to prevent
+// any possibility of SQL injection via the block param.
+const BLOCK_TABLES = {
+  1: 'block1_questions',
+  2: 'block2_questions',
+  3: 'block3_questions',
+};
+
+// ── GET /api/questions ───────────────────────────────────────
+//
+// Fetches the task content row for a given day + block.
+// The frontend reads whichever fields it needs from day_content.
+//
+// Query params:
+//   day   (integer, required)  e.g. ?day=1
+//   block (integer 1-3, req.)  e.g. &block=2
+//
+// Response 200: { day_content: { id, day, <question columns>... } }
+// Response 400: { error: "..." }   — bad params
+// Response 404: { day_content: null }  — no row for that day/block
+// Response 500: { error: "Internal server error" }
+//
+app.get('/api/questions', async (req, res) => {
+  const day   = parseDay(req.query.day);
+  const block = parseBlock(req.query.block);
+
+  if (!day || !block) {
+    return res.status(400).json({
+      error: 'day (integer ≥ 1) and block (1, 2, or 3) are required query params',
+    });
+  }
+
+  const table = BLOCK_TABLES[block];
+
+  const { data, error } = await supabase
+    .from(table)
+    .select('*')
+    .eq('day', day)
+    .single();          // exactly one row per day
+
+  if (error) {
+    // PGRST116 = "no rows found" from PostgREST / Supabase
+    if (error.code === 'PGRST116') {
+      return res.status(404).json({ day_content: null });
+    }
+    console.error('[GET /api/questions]', error.message);
+    return res.status(500).json({ error: 'Internal server error' });
+  }
+
+  return res.status(200).json({ day_content: data });
+});
+
+
+// ── POST /api/answers ────────────────────────────────────────
+//
+// Saves one student answer. Called on every Next / Finish click.
+// answer_text may be empty string (records a skipped question).
+//
+// Body: {
+//   session_id,     string  required
+//   day,            integer required
+//   block,          integer required  1-3
+//   question_field, string  required  e.g. "natural_english_rewrite"
+//   question_type,  string  optional  human-readable label
+//   answer_text,    string  optional  what the student typed
+//   time_spent_ms,  integer optional  ms on this question
+// }
+//
+// Response 201: { ok: true }
+// Response 400: { error: "..." }
+// Response 500: { error: "..." }
+//
+app.post('/api/answers', async (req, res) => {
+  const {
+    session_id,
+    day,
+    block,
+    question_field,
+    question_type,
+    answer_text,
+    time_spent_ms,
+  } = req.body;
+
+  if (!isValidText(session_id, 200)) {
+    return res.status(400).json({ error: 'session_id is required' });
+  }
+
+  const parsedDay   = parseDay(day);
+  const parsedBlock = parseBlock(block);
+
+  if (!parsedDay || !parsedBlock) {
+    return res.status(400).json({ error: 'day (integer ≥ 1) and block (1–3) are required' });
+  }
+
+  if (!isValidText(question_field, 100)) {
+    return res.status(400).json({ error: 'question_field is required' });
+  }
+
+  const { error } = await supabase
+    .from('answers')
+    .insert({
+      session_id:     session_id.trim(),
+      day:            parsedDay,
+      block:          parsedBlock,
+      question_field: question_field.trim(),
+      question_type:  isValidText(question_type, 200) ? question_type.trim() : null,
+      answer_text:    typeof answer_text === 'string' ? answer_text : '',
+      time_spent_ms:  Number.isInteger(time_spent_ms) ? time_spent_ms : null,
+    });
+
+  if (error) {
+    console.error('[POST /api/answers]', error.message);
+    return res.status(500).json({ error: 'Failed to save answer' });
+  }
+
+  return res.status(201).json({ ok: true });
+});
+
+
+// ── POST /api/sessions ───────────────────────────────────────
+//
+// Registers a new IELTS browser session when the app loads.
+// Uses upsert so duplicate calls (e.g. React strict mode) are safe.
+//
+// Body: {
+//   session_id,  string  required
+//   started_at,  string  ISO timestamp
+//   device_info, object  { userAgent, language, screenW, screenH, timezone, referrer }
+// }
+//
+// Response 201: { ok: true }
+// Response 400: { error: "..." }
+// Response 500: { error: "..." }
+//
+app.post('/api/sessions', async (req, res) => {
+  const { session_id, started_at, device_info } = req.body;
+
+  if (!isValidText(session_id, 200)) {
+    return res.status(400).json({ error: 'session_id is required' });
+  }
+
+  // Whitelist the fields we accept from device_info to keep the DB clean
+  const safeDeviceInfo = (device_info && typeof device_info === 'object')
+    ? {
+        userAgent: device_info.userAgent  || null,
+        language:  device_info.language   || null,
+        screenW:   device_info.screenW    || null,
+        screenH:   device_info.screenH    || null,
+        timezone:  device_info.timezone   || null,
+        referrer:  device_info.referrer   || null,
+      }
+    : null;
+
+  const { error } = await supabase
+    .from('ielts_sessions')
+    .upsert(
+      {
+        session_id:  session_id.trim(),
+        started_at:  started_at || new Date().toISOString(),
+        device_info: safeDeviceInfo,
+      },
+      { onConflict: 'session_id', ignoreDuplicates: true }
+    );
+
+  if (error) {
+    console.error('[POST /api/sessions]', error.message);
+    return res.status(500).json({ error: 'Failed to save session' });
+  }
+
+  return res.status(201).json({ ok: true });
+});
+
+
+// ── POST /api/events ─────────────────────────────────────────
+//
+// Tracks every user interaction fired by Analytics.track().
+// No strict allowlist on event_name — IELTS events are numerous
+// and evolving, so we store freely and filter in reporting.
+//
+// Body: {
+//   session_id,         string  required
+//   event_name,         string  required  e.g. "next_question"
+//   time_in_session_ms, integer optional  ms since session start
+//   data,               object  optional  arbitrary event payload
+// }
+//
+// Response 201: { ok: true }
+// Response 400: { error: "..." }
+// Response 500: { error: "..." }
+//
+app.post('/api/events', async (req, res) => {
+  const { session_id, event_name, time_in_session_ms, data } = req.body;
+
+  if (!isValidText(session_id, 200)) {
+    return res.status(400).json({ error: 'session_id is required' });
+  }
+
+  if (!isValidText(event_name, 100)) {
+    return res.status(400).json({ error: 'event_name is required' });
+  }
+
+  const safeData = (data && typeof data === 'object' && !Array.isArray(data))
+    ? data
+    : null;
+
+  const { error } = await supabase
+    .from('ielts_events')
+    .insert({
+      session_id:         session_id.trim(),
+      event_name:         event_name.trim(),
+      time_in_session_ms: Number.isInteger(time_in_session_ms) ? time_in_session_ms : null,
+      data:               safeData,
+    });
+
+  if (error) {
+    console.error('[POST /api/events]', error.message);
+    return res.status(500).json({ error: 'Failed to save event' });
+  }
+
+  return res.status(201).json({ ok: true });
+});
+
+
+// ============================================================
+// 404 CATCH-ALL  (keep at the very bottom, after all routes)
+// ============================================================
 app.use((_req, res) => {
   res.status(404).json({ error: 'Not found' });
 });
 
+
 // ─── START ───────────────────────────────────────────────────
 app.listen(PORT, () => {
-  console.log(`[BilimTap] Server running on port ${PORT}`);
-  console.log(`[BilimTap] Accepting requests from: ${ALLOWED_ORIGIN}`);
+  console.log(`[Server] Running on port ${PORT}`);
+  console.log(`[Server] Accepting requests from: ${ALLOWED_ORIGIN}`);
 });
