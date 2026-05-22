@@ -6,28 +6,34 @@
 //
 // Contains two feature sets:
 //   1. BilimTap Validation Campaign  (original)
-//   2. IELTS Prep Platform           (added below, clearly separated)
+//   2. IELTS Prep Platform           (updated)
 //
 // Shared Supabase project & environment variables.
 //
 // Setup:
-//   npm install express @supabase/supabase-js cors helmet
+//   npm install express @supabase/supabase-js cors helmet multer openai
 //
 // Required environment variables (set in Railway dashboard):
 //   SUPABASE_URL      — from Supabase project settings
 //   SUPABASE_KEY      — service_role key (not anon key)
 //   ALLOWED_ORIGIN    — your frontend URL e.g. https://bilimtap.vercel.app
+//   OPENAI_WHISPER_KEY — OpenAI key for Whisper transcription
+//   OPENAI_GPT_KEY    — OpenAI key for GPT scoring (can be same key)
 //   PORT              — Railway sets this automatically
 // ============================================================
 
 const express    = require('express');
 const cors       = require('cors');
 const helmet     = require('helmet');
+const multer     = require('multer');
+const path       = require('path');
 const { createClient } = require('@supabase/supabase-js');
+const OpenAI     = require('openai');
+const { Readable } = require('stream');
 require('dotenv').config();
 
 // ─── ENV VALIDATION ─────────────────────────────────────────
-const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_KEY', 'ALLOWED_ORIGIN'];
+const REQUIRED_ENV = ['SUPABASE_URL', 'SUPABASE_KEY', 'ALLOWED_ORIGIN', 'OPENAI_WHISPER_KEY', 'OPENAI_GPT_KEY'];
 const missing = REQUIRED_ENV.filter(k => !process.env[k]);
 if (missing.length) {
   console.error(`[FATAL] Missing environment variables: ${missing.join(', ')}`);
@@ -38,11 +44,29 @@ const {
   SUPABASE_URL,
   SUPABASE_KEY,
   ALLOWED_ORIGIN,
+  OPENAI_WHISPER_KEY,
+  OPENAI_GPT_KEY,
   PORT = 3000,
 } = process.env;
 
 // ─── SUPABASE CLIENT ────────────────────────────────────────
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+
+// ─── OPENAI CLIENTS ─────────────────────────────────────────
+const openaiWhisper = new OpenAI({ apiKey: OPENAI_WHISPER_KEY });
+const openaiGpt     = new OpenAI({ apiKey: OPENAI_GPT_KEY });
+
+// ─── MULTER (in-memory audio upload) ────────────────────────
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits:  { fileSize: 25 * 1024 * 1024 }, // 25 MB — Whisper max
+  fileFilter(_req, file, cb) {
+    const allowed = ['audio/webm', 'audio/ogg', 'audio/wav', 'audio/mpeg',
+                     'audio/mp4', 'audio/x-m4a', 'audio/flac', 'video/webm'];
+    if (allowed.includes(file.mimetype)) return cb(null, true);
+    cb(new Error(`Unsupported audio type: ${file.mimetype}`));
+  },
+});
 
 // ─── EXPRESS SETUP ──────────────────────────────────────────
 const app = express();
@@ -55,7 +79,11 @@ app.use(cors({
   allowedHeaders: ['Content-Type'],
 }));
 
-app.use(express.json({ limit: '16kb' }));
+// Note: multer handles multipart; express.json handles the rest.
+app.use((req, _res, next) => {
+  if (req.is('multipart/form-data')) return next();
+  express.json({ limit: '16kb' })(req, _res, next);
+});
 
 
 // ============================================================
@@ -256,101 +284,26 @@ app.post('/submit', async (req, res) => {
 
   const hasPhone = isValidText(phone, 30);
   const hasEmail = isValidText(email, 200);
+
   if (!hasPhone && !hasEmail) {
-    return res.status(400).json({ error: 'phone or email is required' });
-  }
-
-  const { data: existing } = await supabase
-    .from('bilimtap_submissions')
-    .select('id')
-    .eq('visitor_id', visitor_id.trim())
-    .limit(1);
-
-  const is_duplicate = Array.isArray(existing) && existing.length > 0;
-
-  const { error: submitError } = await supabase
-    .from('bilimtap_submissions')
-    .insert({
-      session_id:  session_id.trim(),
-      visitor_id:  visitor_id.trim(),
-      phone:       hasPhone ? phone.trim() : null,
-      email:       hasEmail ? email.trim().toLowerCase() : null,
-      name:        isValidText(name, 200) ? name.trim() : null,
-      course_id:   course_id.trim(),
-      is_duplicate,
-    });
-
-  if (submitError) {
-    console.error('[/submit] Supabase insert error:', submitError.message);
-    return res.status(500).json({ error: 'Failed to save submission' });
-  }
-
-  await supabase
-    .from('bilimtap_events')
-    .insert({
-      session_id:      session_id.trim(),
-      visitor_id:      visitor_id.trim(),
-      event_type:      'form_submit',
-      course_id:       course_id.trim(),
-      metadata:        { has_phone: hasPhone, has_email: hasEmail, is_duplicate },
-      time_on_page_ms: Number.isInteger(time_on_page_ms) ? time_on_page_ms : null,
-    });
-
-  await supabase
-    .from('bilimtap_sessions')
-    .update({ did_submit_form: true, did_start_form: true, last_seen_at: new Date().toISOString() })
-    .eq('session_id', session_id.trim());
-
-  res.json({ ok: true, is_duplicate });
-});
-
-// ── POST /tutor ───────────────────────────────────────────────
-app.post('/tutor', async (req, res) => {
-  const {
-    name,
-    phone,
-    email,
-    profession,
-    experience_years,
-    course_idea,
-    about,
-  } = req.body;
-
-  if (!isValidText(name, 200)) {
-    return res.status(400).json({ error: 'name is required' });
-  }
-  if (!isValidText(phone, 30)) {
-    return res.status(400).json({ error: 'phone is required' });
-  }
-  if (!VALID_PROFESSIONS.has(profession)) {
-    return res.status(400).json({ error: 'Invalid profession value' });
-  }
-  if (!VALID_EXPERIENCE.has(experience_years)) {
-    return res.status(400).json({ error: 'Invalid experience_years value' });
-  }
-  if (!isValidText(course_idea, 500)) {
-    return res.status(400).json({ error: 'course_idea is required' });
-  }
-  if (!isValidText(about, 2000)) {
-    return res.status(400).json({ error: 'about is required' });
+    return res.status(400).json({ error: 'At least phone or email is required' });
   }
 
   const { error } = await supabase
-    .from('bilimtap_tutor_applications')
+    .from('bilimtap_leads')
     .insert({
-      name:             name.trim(),
-      phone:            phone.trim(),
-      email:            isValidText(email, 200) ? email.trim().toLowerCase() : null,
-      profession,
-      experience_years,
-      course_idea:      course_idea.trim(),
-      about:            about.trim(),
-      status:           'new',
+      session_id:      session_id.trim(),
+      visitor_id:      visitor_id.trim(),
+      phone:           hasPhone ? phone.trim() : null,
+      email:           hasEmail ? email.trim() : null,
+      name:            isValidText(name, 200) ? name.trim() : null,
+      course_id:       course_id.trim(),
+      time_on_page_ms: Number.isInteger(time_on_page_ms) ? time_on_page_ms : null,
     });
 
   if (error) {
-    console.error('[/tutor] Supabase insert error:', error.message);
-    return res.status(500).json({ error: 'Failed to save tutor application' });
+    console.error('[/submit] Supabase error:', error.message);
+    return res.status(500).json({ error: 'Failed to save lead' });
   }
 
   res.json({ ok: true });
@@ -358,21 +311,7 @@ app.post('/tutor', async (req, res) => {
 
 
 // ============================================================
-// ============================================================
-//
-//   IELTS PREP PLATFORM — Endpoints
-//   Tables used (all in the same Supabase project):
-//     ielts_sessions        — one row per browser session
-//     ielts_events          — one row per user interaction
-//     block1_questions      — task content for Block 1, one row per day
-//     block2_questions      — task content for Block 2, one row per day
-//     block3_questions      — task content for Block 3, one row per day
-//     answers               — all student answers across all blocks
-//
-//   All routes are prefixed with /api/ to avoid collisions
-//   with the existing BilimTap routes above.
-//
-// ============================================================
+// IELTS PREP PLATFORM — routes
 // ============================================================
 
 // ── HELPERS — IELTS ─────────────────────────────────────────
@@ -403,20 +342,30 @@ const BLOCK_TABLES = {
   3: 'block3_questions',
 };
 
+// IELTS Band descriptors for GPT scoring prompt
+const IELTS_SCORING_PROMPT = `You are an expert IELTS examiner. Evaluate the following spoken response (transcribed from audio) for an IELTS Speaking task.
+
+Score the response on these four IELTS criteria (each 0–9, half-band increments allowed):
+1. Fluency & Coherence
+2. Lexical Resource
+3. Grammatical Range & Accuracy
+4. Pronunciation (inferred from word choice and structure since this is a transcript)
+
+Return ONLY valid JSON in exactly this shape:
+{
+  "overall_band": 7.0,
+  "fluency_coherence": 7.0,
+  "lexical_resource": 6.5,
+  "grammatical_range": 7.0,
+  "pronunciation": 6.5,
+  "strengths": "2–3 sentence description of what the candidate did well.",
+  "improvements": "2–3 sentence description of areas to improve.",
+  "examiner_note": "One sentence overall comment."
+}
+
+Do not include any text outside the JSON object.`;
+
 // ── GET /api/questions ───────────────────────────────────────
-//
-// Fetches the task content row for a given day + block.
-// The frontend reads whichever fields it needs from day_content.
-//
-// Query params:
-//   day   (integer, required)  e.g. ?day=1
-//   block (integer 1-3, req.)  e.g. &block=2
-//
-// Response 200: { day_content: { id, day, <question columns>... } }
-// Response 400: { error: "..." }   — bad params
-// Response 404: { day_content: null }  — no row for that day/block
-// Response 500: { error: "Internal server error" }
-//
 app.get('/api/questions', async (req, res) => {
   const day   = parseDay(req.query.day);
   const block = parseBlock(req.query.block);
@@ -433,10 +382,9 @@ app.get('/api/questions', async (req, res) => {
     .from(table)
     .select('*')
     .eq('day', day)
-    .single();          // exactly one row per day
+    .single();
 
   if (error) {
-    // PGRST116 = "no rows found" from PostgREST / Supabase
     if (error.code === 'PGRST116') {
       return res.status(404).json({ day_content: null });
     }
@@ -449,24 +397,6 @@ app.get('/api/questions', async (req, res) => {
 
 
 // ── POST /api/answers ────────────────────────────────────────
-//
-// Saves one student answer. Called on every Next / Finish click.
-// answer_text may be empty string (records a skipped question).
-//
-// Body: {
-//   session_id,     string  required
-//   day,            integer required
-//   block,          integer required  1-3
-//   question_field, string  required  e.g. "natural_english_rewrite"
-//   question_type,  string  optional  human-readable label
-//   answer_text,    string  optional  what the student typed
-//   time_spent_ms,  integer optional  ms on this question
-// }
-//
-// Response 201: { ok: true }
-// Response 400: { error: "..." }
-// Response 500: { error: "..." }
-//
 app.post('/api/answers', async (req, res) => {
   const {
     session_id,
@@ -515,20 +445,6 @@ app.post('/api/answers', async (req, res) => {
 
 
 // ── POST /api/sessions ───────────────────────────────────────
-//
-// Registers a new IELTS browser session when the app loads.
-// Uses upsert so duplicate calls (e.g. React strict mode) are safe.
-//
-// Body: {
-//   session_id,  string  required
-//   started_at,  string  ISO timestamp
-//   device_info, object  { userAgent, language, screenW, screenH, timezone, referrer }
-// }
-//
-// Response 201: { ok: true }
-// Response 400: { error: "..." }
-// Response 500: { error: "..." }
-//
 app.post('/api/sessions', async (req, res) => {
   const { session_id, started_at, device_info } = req.body;
 
@@ -536,7 +452,6 @@ app.post('/api/sessions', async (req, res) => {
     return res.status(400).json({ error: 'session_id is required' });
   }
 
-  // Whitelist the fields we accept from device_info to keep the DB clean
   const safeDeviceInfo = (device_info && typeof device_info === 'object')
     ? {
         userAgent: device_info.userAgent  || null,
@@ -569,22 +484,6 @@ app.post('/api/sessions', async (req, res) => {
 
 
 // ── POST /api/events ─────────────────────────────────────────
-//
-// Tracks every user interaction fired by Analytics.track().
-// No strict allowlist on event_name — IELTS events are numerous
-// and evolving, so we store freely and filter in reporting.
-//
-// Body: {
-//   session_id,         string  required
-//   event_name,         string  required  e.g. "next_question"
-//   time_in_session_ms, integer optional  ms since session start
-//   data,               object  optional  arbitrary event payload
-// }
-//
-// Response 201: { ok: true }
-// Response 400: { error: "..." }
-// Response 500: { error: "..." }
-//
 app.post('/api/events', async (req, res) => {
   const { session_id, event_name, time_in_session_ms, data } = req.body;
 
@@ -615,6 +514,173 @@ app.post('/api/events', async (req, res) => {
   }
 
   return res.status(201).json({ ok: true });
+});
+
+
+// ── POST /api/speaking/submit ────────────────────────────────
+//
+// Accepts a multipart audio recording for a Block 3 speaking question.
+// Pipeline:
+//   1. Receive audio blob (WebM/OGG/WAV etc.)
+//   2. Upload raw audio to Supabase Storage bucket "speaking-recordings"
+//   3. Transcribe via OpenAI Whisper
+//   4. Score transcript via GPT-4o
+//   5. Persist everything to `speaking_submissions` table
+//   6. Return { ok, transcript, scores, storage_path }
+//
+// Form fields (multipart):
+//   audio           — audio file blob  (required)
+//   session_id      — string           (required)
+//   day             — integer          (required)
+//   question_field  — string           (required)  e.g. "speaking_part1"
+//   question_type   — string           (optional)
+//   prep_time_ms    — integer          (optional)  ms from page load to record start
+//   retry_count     — integer          (optional)  how many times user re-recorded
+//
+app.post('/api/speaking/submit', upload.single('audio'), async (req, res) => {
+  // ── 1. Validate inputs ──────────────────────────────────
+  if (!req.file) {
+    return res.status(400).json({ error: 'audio file is required' });
+  }
+
+  const { session_id, day, question_field, question_type, prep_time_ms, retry_count } = req.body;
+
+  if (!isValidText(session_id, 200)) {
+    return res.status(400).json({ error: 'session_id is required' });
+  }
+
+  const parsedDay = parseDay(day);
+  if (!parsedDay) {
+    return res.status(400).json({ error: 'day (integer ≥ 1) is required' });
+  }
+
+  if (!isValidText(question_field, 100)) {
+    return res.status(400).json({ error: 'question_field is required' });
+  }
+
+  const audioBuffer = req.file.buffer;
+  const mimeType    = req.file.mimetype;
+  // Map MIME → file extension for Whisper
+  const EXT_MAP = {
+    'audio/webm':   'webm',
+    'video/webm':   'webm',
+    'audio/ogg':    'ogg',
+    'audio/wav':    'wav',
+    'audio/mpeg':   'mp3',
+    'audio/mp4':    'm4a',
+    'audio/x-m4a':  'm4a',
+    'audio/flac':   'flac',
+  };
+  const ext = EXT_MAP[mimeType] || 'webm';
+
+  // ── 2. Upload to Supabase Storage ───────────────────────
+  const storagePath = `day${parsedDay}/${question_field.trim()}/${session_id.trim()}_${Date.now()}.${ext}`;
+
+  const { error: storageError } = await supabase
+    .storage
+    .from('speaking-recordings')
+    .upload(storagePath, audioBuffer, {
+      contentType:  mimeType,
+      upsert:       false,
+      cacheControl: '3600',
+    });
+
+  if (storageError) {
+    console.error('[/api/speaking/submit] Storage upload error:', storageError.message);
+    return res.status(500).json({ error: 'Failed to upload audio' });
+  }
+
+  // ── 3. Transcribe with Whisper ──────────────────────────
+  let transcript = '';
+  try {
+    // Whisper SDK accepts a File-like object. We wrap the Buffer.
+    const audioFile = new File(
+      [audioBuffer],
+      `recording.${ext}`,
+      { type: mimeType }
+    );
+    const transcription = await openaiWhisper.audio.transcriptions.create({
+      model: 'whisper-1',
+      file:  audioFile,
+      language: 'en',
+      response_format: 'text',
+    });
+    transcript = typeof transcription === 'string'
+      ? transcription.trim()
+      : (transcription.text || '').trim();
+  } catch (whisperErr) {
+    console.error('[/api/speaking/submit] Whisper error:', whisperErr.message);
+    // Non-fatal: we continue and store an empty transcript
+    transcript = '';
+  }
+
+  // ── 4. Score with GPT-4o ────────────────────────────────
+  let scores = null;
+  if (transcript) {
+    try {
+      const completion = await openaiGpt.chat.completions.create({
+        model: 'gpt-4o',
+        temperature: 0.2,
+        max_tokens:  512,
+        messages: [
+          { role: 'system', content: IELTS_SCORING_PROMPT },
+          {
+            role: 'user',
+            content: `Question type: ${(question_type || question_field).trim()}\n\nTranscript:\n${transcript}`,
+          },
+        ],
+      });
+      const raw = completion.choices[0]?.message?.content || '';
+      scores = JSON.parse(raw);
+    } catch (gptErr) {
+      console.error('[/api/speaking/submit] GPT scoring error:', gptErr.message);
+      // Non-fatal
+    }
+  }
+
+  // ── 5. Persist to speaking_submissions ──────────────────
+  const { error: dbError } = await supabase
+    .from('speaking_submissions')
+    .insert({
+      session_id:     session_id.trim(),
+      day:            parsedDay,
+      question_field: question_field.trim(),
+      question_type:  isValidText(question_type, 200) ? question_type.trim() : null,
+      storage_path:   storagePath,
+      transcript:     transcript || null,
+      scores:         scores     || null,
+      prep_time_ms:   Number.isInteger(Number(prep_time_ms))   ? Number(prep_time_ms)   : null,
+      retry_count:    Number.isInteger(Number(retry_count))    ? Number(retry_count)    : null,
+    });
+
+  if (dbError) {
+    console.error('[/api/speaking/submit] DB insert error:', dbError.message);
+    // We already stored the audio; return partial success
+    return res.status(207).json({
+      ok:           false,
+      warning:      'Audio stored but DB record failed',
+      storage_path: storagePath,
+      transcript,
+      scores,
+    });
+  }
+
+  return res.status(201).json({
+    ok:           true,
+    storage_path: storagePath,
+    transcript,
+    scores,
+  });
+});
+
+
+// ── Error handler for multer ─────────────────────────────────
+app.use((err, _req, res, _next) => {
+  if (err instanceof multer.MulterError || err.message?.startsWith('Unsupported audio')) {
+    return res.status(400).json({ error: err.message });
+  }
+  console.error('[Unhandled error]', err);
+  res.status(500).json({ error: 'Internal server error' });
 });
 
 
