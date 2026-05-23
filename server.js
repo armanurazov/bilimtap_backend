@@ -8,28 +8,24 @@
 //   1. BilimTap Validation Campaign  (original)
 //   2. IELTS Prep Platform           (updated)
 //
-// Shared Supabase project & environment variables.
-//
 // Setup:
 //   npm install express @supabase/supabase-js cors helmet multer openai
 //
-// Required environment variables (set in Railway dashboard):
-//   SUPABASE_URL      — from Supabase project settings
-//   SUPABASE_KEY      — service_role key (not anon key)
-//   ALLOWED_ORIGIN    — your frontend URL e.g. https://bilimtap.vercel.app
-//   OPENAI_WHISPER_KEY — OpenAI key for Whisper transcription
-//   OPENAI_GPT_KEY    — OpenAI key for GPT scoring (can be same key)
-//   PORT              — Railway sets this automatically
+// Required environment variables (Railway dashboard):
+//   SUPABASE_URL        — Supabase project URL
+//   SUPABASE_KEY        — service_role key (not anon key)
+//   ALLOWED_ORIGIN      — frontend URL e.g. https://bilimtap.vercel.app
+//   OPENAI_WHISPER_KEY  — OpenAI key for Whisper transcription
+//   OPENAI_GPT_KEY      — OpenAI key for GPT scoring (can be same key)
+//   PORT                — set automatically by Railway
 // ============================================================
 
 const express    = require('express');
 const cors       = require('cors');
 const helmet     = require('helmet');
 const multer     = require('multer');
-const path       = require('path');
 const { createClient } = require('@supabase/supabase-js');
 const OpenAI     = require('openai');
-const { Readable } = require('stream');
 require('dotenv').config();
 
 // ─── ENV VALIDATION ─────────────────────────────────────────
@@ -61,8 +57,10 @@ const upload = multer({
   storage: multer.memoryStorage(),
   limits:  { fileSize: 25 * 1024 * 1024 }, // 25 MB — Whisper max
   fileFilter(_req, file, cb) {
-    const allowed = ['audio/webm', 'audio/ogg', 'audio/wav', 'audio/mpeg',
-                     'audio/mp4', 'audio/x-m4a', 'audio/flac', 'video/webm'];
+    const allowed = [
+      'audio/webm', 'audio/ogg', 'audio/wav', 'audio/mpeg',
+      'audio/mp4', 'audio/x-m4a', 'audio/flac', 'video/webm',
+    ];
     if (allowed.includes(file.mimetype)) return cb(null, true);
     cb(new Error(`Unsupported audio type: ${file.mimetype}`));
   },
@@ -79,7 +77,7 @@ app.use(cors({
   allowedHeaders: ['Content-Type'],
 }));
 
-// Note: multer handles multipart; express.json handles the rest.
+// multer handles multipart; express.json handles the rest
 app.use((req, _res, next) => {
   if (req.is('multipart/form-data')) return next();
   express.json({ limit: '16kb' })(req, _res, next);
@@ -122,13 +120,8 @@ function isValidText(val, max = 500) {
 }
 
 const VALID_EVENTS = new Set([
-  'page_view',
-  'course_card_click',
-  'modal_open',
-  'modal_close',
-  'form_start',
-  'form_submit',
-  'page_exit',
+  'page_view', 'course_card_click', 'modal_open', 'modal_close',
+  'form_start', 'form_submit', 'page_exit',
 ]);
 
 const VALID_PROFESSIONS = new Set([
@@ -143,7 +136,6 @@ const VALID_EXPERIENCE = new Set(['less-1', '1-3', '3-5', '5-plus']);
 // ROUTES — BILIMTAP (original, unchanged)
 // ============================================================
 
-// Health check
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok', ts: new Date().toISOString() });
 });
@@ -151,28 +143,15 @@ app.get('/health', (_req, res) => {
 // ── POST /session ────────────────────────────────────────────
 app.post('/session', async (req, res) => {
   const {
-    session_id,
-    visitor_id,
-    utm_source,
-    utm_medium,
-    utm_campaign,
-    utm_content,
-    utm_term,
-    referrer,
-    landing_url,
-    screen_width,
-    language,
-    is_bot,
+    session_id, visitor_id, utm_source, utm_medium, utm_campaign,
+    utm_content, utm_term, referrer, landing_url, screen_width, language, is_bot,
   } = req.body;
 
   if (!isValidText(session_id, 100) || !isValidText(visitor_id, 100)) {
     return res.status(400).json({ error: 'session_id and visitor_id are required' });
   }
 
-  const ua          = req.headers['user-agent'] || '';
-  const device_type = parseDevice(ua);
-  const browser     = parseBrowser(ua);
-  const os          = parseOS(ua);
+  const ua = req.headers['user-agent'] || '';
 
   const { error } = await supabase
     .from('bilimtap_sessions')
@@ -186,9 +165,9 @@ app.post('/session', async (req, res) => {
       utm_term:     utm_term     || null,
       referrer:     referrer     || null,
       landing_url:  landing_url  || null,
-      device_type,
-      browser,
-      os,
+      device_type:  parseDevice(ua),
+      browser:      parseBrowser(ua),
+      os:           parseOS(ua),
       screen_width: Number.isInteger(screen_width) ? screen_width : null,
       language:     language     || null,
       is_bot:       is_bot === true,
@@ -198,32 +177,21 @@ app.post('/session', async (req, res) => {
     console.error('[/session] Supabase error:', error.message);
     return res.status(500).json({ error: 'Failed to create session' });
   }
-
   res.json({ ok: true });
 });
 
 // ── POST /event ──────────────────────────────────────────────
 app.post('/event', async (req, res) => {
-  const {
-    session_id,
-    visitor_id,
-    event_type,
-    course_id,
-    metadata,
-    time_on_page_ms,
-  } = req.body;
+  const { session_id, visitor_id, event_type, course_id, metadata, time_on_page_ms } = req.body;
 
   if (!isValidText(session_id, 100) || !isValidText(visitor_id, 100)) {
     return res.status(400).json({ error: 'session_id and visitor_id are required' });
   }
-
   if (!VALID_EVENTS.has(event_type)) {
     return res.status(400).json({ error: `Invalid event_type: ${event_type}` });
   }
 
-  const safeMeta = (metadata && typeof metadata === 'object' && !Array.isArray(metadata))
-    ? metadata
-    : null;
+  const safeMeta = (metadata && typeof metadata === 'object' && !Array.isArray(metadata)) ? metadata : null;
 
   const { error: eventError } = await supabase
     .from('bilimtap_events')
@@ -237,7 +205,7 @@ app.post('/event', async (req, res) => {
     });
 
   if (eventError) {
-    console.error('[/event] Supabase insert error:', eventError.message);
+    console.error('[/event] insert error:', eventError.message);
     return res.status(500).json({ error: 'Failed to record event' });
   }
 
@@ -249,14 +217,7 @@ app.post('/event', async (req, res) => {
 
   if (Object.keys(sessionUpdates).length > 0) {
     sessionUpdates.last_seen_at = new Date().toISOString();
-    const { error: sessionError } = await supabase
-      .from('bilimtap_sessions')
-      .update(sessionUpdates)
-      .eq('session_id', session_id.trim());
-
-    if (sessionError) {
-      console.warn('[/event] Session update warning:', sessionError.message);
-    }
+    await supabase.from('bilimtap_sessions').update(sessionUpdates).eq('session_id', session_id.trim());
   }
 
   res.json({ ok: true });
@@ -264,42 +225,34 @@ app.post('/event', async (req, res) => {
 
 // ── POST /submit ─────────────────────────────────────────────
 app.post('/submit', async (req, res) => {
-  const {
-    session_id,
-    visitor_id,
-    phone,
-    email,
-    name,
-    course_id,
-    time_on_page_ms,
-  } = req.body;
+  const { session_id, visitor_id, phone, email, name, course_id, time_on_page_ms } = req.body;
 
   if (!isValidText(session_id, 100) || !isValidText(visitor_id, 100)) {
     return res.status(400).json({ error: 'session_id and visitor_id are required' });
   }
-
   if (!isValidText(course_id, 100)) {
     return res.status(400).json({ error: 'course_id is required' });
   }
 
   const hasPhone = isValidText(phone, 30);
   const hasEmail = isValidText(email, 200);
-
   if (!hasPhone && !hasEmail) {
-    return res.status(400).json({ error: 'At least phone or email is required' });
+    return res.status(400).json({ error: 'phone or email is required' });
   }
 
-  const { error } = await supabase
-    .from('bilimtap_leads')
-    .insert({
-      session_id:      session_id.trim(),
-      visitor_id:      visitor_id.trim(),
-      phone:           hasPhone ? phone.trim() : null,
-      email:           hasEmail ? email.trim() : null,
-      name:            isValidText(name, 200) ? name.trim() : null,
-      course_id:       course_id.trim(),
-      time_on_page_ms: Number.isInteger(time_on_page_ms) ? time_on_page_ms : null,
-    });
+  const { data: existing } = await supabase
+    .from('bilimtap_submissions').select('id').eq('visitor_id', visitor_id.trim()).limit(1);
+  const is_duplicate = Array.isArray(existing) && existing.length > 0;
+
+  const { error } = await supabase.from('bilimtap_submissions').insert({
+    session_id:  session_id.trim(),
+    visitor_id:  visitor_id.trim(),
+    phone:       hasPhone ? phone.trim() : null,
+    email:       hasEmail ? email.trim().toLowerCase() : null,
+    name:        isValidText(name, 200) ? name.trim() : null,
+    course_id:   course_id.trim(),
+    is_duplicate,
+  });
 
   if (error) {
     console.error('[/submit] Supabase error:', error.message);
@@ -309,61 +262,103 @@ app.post('/submit', async (req, res) => {
   res.json({ ok: true });
 });
 
+// ── POST /tutor ───────────────────────────────────────────────
+app.post('/tutor', async (req, res) => {
+  const { name, phone, email, profession, experience_years, course_idea, about } = req.body;
+
+  if (!isValidText(name, 200))         return res.status(400).json({ error: 'name is required' });
+  if (!isValidText(phone, 30))         return res.status(400).json({ error: 'phone is required' });
+  if (!VALID_PROFESSIONS.has(profession))  return res.status(400).json({ error: 'Invalid profession value' });
+  if (!VALID_EXPERIENCE.has(experience_years)) return res.status(400).json({ error: 'Invalid experience_years value' });
+  if (!isValidText(course_idea, 500))  return res.status(400).json({ error: 'course_idea is required' });
+  if (!isValidText(about, 2000))       return res.status(400).json({ error: 'about is required' });
+
+  const { error } = await supabase.from('bilimtap_tutor_applications').insert({
+    name:             name.trim(),
+    phone:            phone.trim(),
+    email:            isValidText(email, 200) ? email.trim().toLowerCase() : null,
+    profession,
+    experience_years,
+    course_idea:      course_idea.trim(),
+    about:            about.trim(),
+    status:           'new',
+  });
+
+  if (error) {
+    console.error('[/tutor] insert error:', error.message);
+    return res.status(500).json({ error: 'Failed to save tutor application' });
+  }
+
+  res.json({ ok: true });
+});
+
 
 // ============================================================
-// IELTS PREP PLATFORM — routes
+// ============================================================
+//
+//   IELTS PREP PLATFORM — Endpoints
+//
+// ============================================================
 // ============================================================
 
 // ── HELPERS — IELTS ─────────────────────────────────────────
 
-/**
- * Parses and validates the block query param.
- * Returns integer 1-3, or null if invalid.
- */
 function parseBlock(raw) {
   const b = parseInt(raw, 10);
   return (b >= 1 && b <= 3) ? b : null;
 }
 
-/**
- * Parses and validates a positive integer day param.
- * Returns integer >= 1, or null if invalid.
- */
 function parseDay(raw) {
   const d = parseInt(raw, 10);
   return (Number.isFinite(d) && d >= 1) ? d : null;
 }
 
-// Valid block table names — used as an allowlist to prevent
-// any possibility of SQL injection via the block param.
 const BLOCK_TABLES = {
   1: 'block1_questions',
   2: 'block2_questions',
   3: 'block3_questions',
 };
 
-// IELTS Band descriptors for GPT scoring prompt
-const IELTS_SCORING_PROMPT = `You are an expert IELTS examiner. Evaluate the following spoken response (transcribed from audio) for an IELTS Speaking task.
+// ─────────────────────────────────────────────────────────────
+// IELTS SCORING SYSTEM PROMPT
+//
+// FIX: The prompt now:
+//   1. Explicitly instructs GPT to use the provided question
+//      text when evaluating relevance and coherence.
+//   2. Defines what constitutes incoherent / off-topic speech
+//      and mandates low scores for such responses.
+//   3. Anchors all band descriptors to the official IELTS scale
+//      so GPT cannot award inflated scores for poor speech.
+//   4. Requires the examiner_note to state when speech was
+//      incoherent or not addressing the question.
+// ─────────────────────────────────────────────────────────────
+const IELTS_SCORING_SYSTEM = `You are a strict, certified IELTS speaking examiner. Your task is to evaluate a candidate's spoken response that has been transcribed to text.
 
-Score the response on these four IELTS criteria (each 0–9, half-band increments allowed):
-1. Fluency & Coherence
-2. Lexical Resource
-3. Grammatical Range & Accuracy
-4. Pronunciation (inferred from word choice and structure since this is a transcript)
+You will be given:
+  1. The IELTS question the candidate was supposed to answer.
+  2. A transcript of what the candidate actually said.
 
-Return ONLY valid JSON in exactly this shape:
+Evaluation rules — follow these exactly:
+- Base your scores strictly on the official IELTS Band Descriptors (0–9 scale, half-band increments allowed).
+- Score 0 if the transcript is empty, entirely unintelligible, or contains no recognisable English words.
+- Score 1–2 for responses that consist of random sounds, gibberish, or words with no coherent meaning.
+- Score 3–4 for responses that contain real English words but are largely incoherent, repetitive, or completely off-topic.
+- Only award Band 5 or above if the response directly addresses the question with recognisable structure and vocabulary.
+- Never inflate scores. A Band 7 requires fluent, well-organised speech with precise vocabulary. Apply this standard rigorously.
+- Relevance matters: if the candidate did not address the question at all, this must reduce Fluency & Coherence significantly.
+- Pronunciation is inferred from spelling irregularities, non-standard word usage, and structural errors visible in the transcript.
+
+Return ONLY valid JSON in exactly this shape — no text before or after:
 {
-  "overall_band": 7.0,
-  "fluency_coherence": 7.0,
-  "lexical_resource": 6.5,
-  "grammatical_range": 7.0,
-  "pronunciation": 6.5,
-  "strengths": "2–3 sentence description of what the candidate did well.",
-  "improvements": "2–3 sentence description of areas to improve.",
-  "examiner_note": "One sentence overall comment."
-}
-
-Do not include any text outside the JSON object.`;
+  "overall_band": 0.0,
+  "fluency_coherence": 0.0,
+  "lexical_resource": 0.0,
+  "grammatical_range": 0.0,
+  "pronunciation": 0.0,
+  "strengths": "Describe any genuine strengths. If there are none, write: No clear strengths identified.",
+  "improvements": "Specific, actionable areas to improve.",
+  "examiner_note": "One honest sentence summarising the response. State clearly if speech was incoherent or off-topic."
+}`;
 
 // ── GET /api/questions ───────────────────────────────────────
 app.get('/api/questions', async (req, res) => {
@@ -376,18 +371,14 @@ app.get('/api/questions', async (req, res) => {
     });
   }
 
-  const table = BLOCK_TABLES[block];
-
   const { data, error } = await supabase
-    .from(table)
+    .from(BLOCK_TABLES[block])
     .select('*')
     .eq('day', day)
     .single();
 
   if (error) {
-    if (error.code === 'PGRST116') {
-      return res.status(404).json({ day_content: null });
-    }
+    if (error.code === 'PGRST116') return res.status(404).json({ day_content: null });
     console.error('[GET /api/questions]', error.message);
     return res.status(500).json({ error: 'Internal server error' });
   }
@@ -398,42 +389,25 @@ app.get('/api/questions', async (req, res) => {
 
 // ── POST /api/answers ────────────────────────────────────────
 app.post('/api/answers', async (req, res) => {
-  const {
-    session_id,
-    day,
-    block,
-    question_field,
-    question_type,
-    answer_text,
-    time_spent_ms,
-  } = req.body;
+  const { session_id, day, block, question_field, question_type, answer_text, time_spent_ms } = req.body;
 
-  if (!isValidText(session_id, 200)) {
-    return res.status(400).json({ error: 'session_id is required' });
-  }
+  if (!isValidText(session_id, 200)) return res.status(400).json({ error: 'session_id is required' });
 
   const parsedDay   = parseDay(day);
   const parsedBlock = parseBlock(block);
+  if (!parsedDay || !parsedBlock) return res.status(400).json({ error: 'day (integer ≥ 1) and block (1–3) are required' });
 
-  if (!parsedDay || !parsedBlock) {
-    return res.status(400).json({ error: 'day (integer ≥ 1) and block (1–3) are required' });
-  }
+  if (!isValidText(question_field, 100)) return res.status(400).json({ error: 'question_field is required' });
 
-  if (!isValidText(question_field, 100)) {
-    return res.status(400).json({ error: 'question_field is required' });
-  }
-
-  const { error } = await supabase
-    .from('answers')
-    .insert({
-      session_id:     session_id.trim(),
-      day:            parsedDay,
-      block:          parsedBlock,
-      question_field: question_field.trim(),
-      question_type:  isValidText(question_type, 200) ? question_type.trim() : null,
-      answer_text:    typeof answer_text === 'string' ? answer_text : '',
-      time_spent_ms:  Number.isInteger(time_spent_ms) ? time_spent_ms : null,
-    });
+  const { error } = await supabase.from('answers').insert({
+    session_id:     session_id.trim(),
+    day:            parsedDay,
+    block:          parsedBlock,
+    question_field: question_field.trim(),
+    question_type:  isValidText(question_type, 200) ? question_type.trim() : null,
+    answer_text:    typeof answer_text === 'string' ? answer_text : '',
+    time_spent_ms:  Number.isInteger(time_spent_ms) ? time_spent_ms : null,
+  });
 
   if (error) {
     console.error('[POST /api/answers]', error.message);
@@ -448,37 +422,26 @@ app.post('/api/answers', async (req, res) => {
 app.post('/api/sessions', async (req, res) => {
   const { session_id, started_at, device_info } = req.body;
 
-  if (!isValidText(session_id, 200)) {
-    return res.status(400).json({ error: 'session_id is required' });
-  }
+  if (!isValidText(session_id, 200)) return res.status(400).json({ error: 'session_id is required' });
 
-  const safeDeviceInfo = (device_info && typeof device_info === 'object')
-    ? {
-        userAgent: device_info.userAgent  || null,
-        language:  device_info.language   || null,
-        screenW:   device_info.screenW    || null,
-        screenH:   device_info.screenH    || null,
-        timezone:  device_info.timezone   || null,
-        referrer:  device_info.referrer   || null,
-      }
-    : null;
+  const safeDeviceInfo = (device_info && typeof device_info === 'object') ? {
+    userAgent: device_info.userAgent || null,
+    language:  device_info.language  || null,
+    screenW:   device_info.screenW   || null,
+    screenH:   device_info.screenH   || null,
+    timezone:  device_info.timezone  || null,
+    referrer:  device_info.referrer  || null,
+  } : null;
 
   const { error } = await supabase
     .from('ielts_sessions')
     .upsert(
-      {
-        session_id:  session_id.trim(),
-        started_at:  started_at || new Date().toISOString(),
-        device_info: safeDeviceInfo,
-      },
+      { session_id: session_id.trim(), started_at: started_at || new Date().toISOString(), device_info: safeDeviceInfo },
       { onConflict: 'session_id', ignoreDuplicates: true }
     );
 
-  if (error) {
-    console.error('[POST /api/sessions]', error.message);
-    return res.status(500).json({ error: 'Failed to save session' });
-  }
-
+  if (error) console.error('[POST /api/sessions]', error.message);
+  // Always 201 — a failed session must never block the user
   return res.status(201).json({ ok: true });
 });
 
@@ -487,175 +450,168 @@ app.post('/api/sessions', async (req, res) => {
 app.post('/api/events', async (req, res) => {
   const { session_id, event_name, time_in_session_ms, data } = req.body;
 
-  if (!isValidText(session_id, 200)) {
-    return res.status(400).json({ error: 'session_id is required' });
-  }
+  if (!isValidText(session_id, 200)) return res.status(400).json({ error: 'session_id is required' });
+  if (!isValidText(event_name, 100)) return res.status(400).json({ error: 'event_name is required' });
 
-  if (!isValidText(event_name, 100)) {
-    return res.status(400).json({ error: 'event_name is required' });
-  }
+  const safeData = (data && typeof data === 'object' && !Array.isArray(data)) ? data : null;
 
-  const safeData = (data && typeof data === 'object' && !Array.isArray(data))
-    ? data
-    : null;
+  const { error } = await supabase.from('ielts_events').insert({
+    session_id:         session_id.trim(),
+    event_name:         event_name.trim(),
+    time_in_session_ms: Number.isInteger(time_in_session_ms) ? time_in_session_ms : null,
+    data:               safeData,
+  });
 
-  const { error } = await supabase
-    .from('ielts_events')
-    .insert({
-      session_id:         session_id.trim(),
-      event_name:         event_name.trim(),
-      time_in_session_ms: Number.isInteger(time_in_session_ms) ? time_in_session_ms : null,
-      data:               safeData,
-    });
-
-  if (error) {
-    console.error('[POST /api/events]', error.message);
-    return res.status(500).json({ error: 'Failed to save event' });
-  }
-
+  if (error) console.error('[POST /api/events]', error.message);
   return res.status(201).json({ ok: true });
 });
 
 
 // ── POST /api/speaking/submit ────────────────────────────────
 //
-// Accepts a multipart audio recording for a Block 3 speaking question.
 // Pipeline:
-//   1. Receive audio blob (WebM/OGG/WAV etc.)
-//   2. Upload raw audio to Supabase Storage bucket "speaking-recordings"
+//   1. Validate multipart fields
+//   2. Upload raw audio to Supabase Storage
 //   3. Transcribe via OpenAI Whisper
-//   4. Score transcript via GPT-4o
-//   5. Persist everything to `speaking_submissions` table
+//   4. Score via GPT-4o — using both the question text and the
+//      transcript so evaluation is contextually accurate
+//   5. Persist everything to speaking_submissions
 //   6. Return { ok, transcript, scores, storage_path }
 //
 // Form fields (multipart):
-//   audio           — audio file blob  (required)
-//   session_id      — string           (required)
-//   day             — integer          (required)
-//   question_field  — string           (required)  e.g. "speaking_part1"
-//   question_type   — string           (optional)
-//   prep_time_ms    — integer          (optional)  ms from page load to record start
-//   retry_count     — integer          (optional)  how many times user re-recorded
+//   audio            — audio blob           (required)
+//   session_id       — string               (required)
+//   day              — integer              (required)
+//   question_field   — string               (required)
+//   question_type    — string               (optional)
+//   question_content — string               (optional) — the actual exam question text
+//   prep_time_ms     — integer              (optional)
+//   retry_count      — integer              (optional)
 //
 app.post('/api/speaking/submit', upload.single('audio'), async (req, res) => {
-  // ── 1. Validate inputs ──────────────────────────────────
-  if (!req.file) {
-    return res.status(400).json({ error: 'audio file is required' });
-  }
 
-  const { session_id, day, question_field, question_type, prep_time_ms, retry_count } = req.body;
+  // ── 1. Validate ──────────────────────────────────────────
+  if (!req.file) return res.status(400).json({ error: 'audio file is required' });
 
-  if (!isValidText(session_id, 200)) {
-    return res.status(400).json({ error: 'session_id is required' });
-  }
+  const {
+    session_id,
+    day,
+    question_field,
+    question_type,
+    question_content,  // FIX: the actual exam question text
+    prep_time_ms,
+    retry_count,
+  } = req.body;
 
+  if (!isValidText(session_id, 200))     return res.status(400).json({ error: 'session_id is required' });
   const parsedDay = parseDay(day);
-  if (!parsedDay) {
-    return res.status(400).json({ error: 'day (integer ≥ 1) is required' });
-  }
-
-  if (!isValidText(question_field, 100)) {
-    return res.status(400).json({ error: 'question_field is required' });
-  }
+  if (!parsedDay)                        return res.status(400).json({ error: 'day (integer ≥ 1) is required' });
+  if (!isValidText(question_field, 100)) return res.status(400).json({ error: 'question_field is required' });
 
   const audioBuffer = req.file.buffer;
   const mimeType    = req.file.mimetype;
-  // Map MIME → file extension for Whisper
+
   const EXT_MAP = {
-    'audio/webm':   'webm',
-    'video/webm':   'webm',
-    'audio/ogg':    'ogg',
-    'audio/wav':    'wav',
-    'audio/mpeg':   'mp3',
-    'audio/mp4':    'm4a',
-    'audio/x-m4a':  'm4a',
-    'audio/flac':   'flac',
+    'audio/webm': 'webm', 'video/webm': 'webm',
+    'audio/ogg':  'ogg',  'audio/wav':  'wav',
+    'audio/mpeg': 'mp3',  'audio/mp4':  'm4a',
+    'audio/x-m4a':'m4a',  'audio/flac': 'flac',
   };
   const ext = EXT_MAP[mimeType] || 'webm';
 
   // ── 2. Upload to Supabase Storage ───────────────────────
   const storagePath = `day${parsedDay}/${question_field.trim()}/${session_id.trim()}_${Date.now()}.${ext}`;
 
-  const { error: storageError } = await supabase
-    .storage
+  const { error: storageError } = await supabase.storage
     .from('speaking-recordings')
-    .upload(storagePath, audioBuffer, {
-      contentType:  mimeType,
-      upsert:       false,
-      cacheControl: '3600',
-    });
+    .upload(storagePath, audioBuffer, { contentType: mimeType, upsert: false, cacheControl: '3600' });
 
   if (storageError) {
-    console.error('[/api/speaking/submit] Storage upload error:', storageError.message);
+    console.error('[/api/speaking/submit] Storage error:', storageError.message);
     return res.status(500).json({ error: 'Failed to upload audio' });
   }
 
   // ── 3. Transcribe with Whisper ──────────────────────────
   let transcript = '';
   try {
-    // Whisper SDK accepts a File-like object. We wrap the Buffer.
-    const audioFile = new File(
-      [audioBuffer],
-      `recording.${ext}`,
-      { type: mimeType }
-    );
-    const transcription = await openaiWhisper.audio.transcriptions.create({
-      model: 'whisper-1',
-      file:  audioFile,
-      language: 'en',
+    const audioFile = new File([audioBuffer], `recording.${ext}`, { type: mimeType });
+    const result = await openaiWhisper.audio.transcriptions.create({
+      model:           'whisper-1',
+      file:            audioFile,
+      language:        'en',
       response_format: 'text',
     });
-    transcript = typeof transcription === 'string'
-      ? transcription.trim()
-      : (transcription.text || '').trim();
+    transcript = (typeof result === 'string' ? result : result.text || '').trim();
   } catch (whisperErr) {
     console.error('[/api/speaking/submit] Whisper error:', whisperErr.message);
-    // Non-fatal: we continue and store an empty transcript
-    transcript = '';
+    // Non-fatal — continue with empty transcript
   }
 
   // ── 4. Score with GPT-4o ────────────────────────────────
+  // FIX: Build a user message that includes:
+  //   a) the actual exam question the student was answering
+  //   b) the transcribed speech
+  // This gives GPT the context it needs to judge relevance,
+  // coherence, and band score accurately.
   let scores = null;
-  if (transcript) {
-    try {
-      const completion = await openaiGpt.chat.completions.create({
-        model: 'gpt-4o',
-        temperature: 0.2,
-        max_tokens:  512,
-        messages: [
-          { role: 'system', content: IELTS_SCORING_PROMPT },
-          {
-            role: 'user',
-            content: `Question type: ${(question_type || question_field).trim()}\n\nTranscript:\n${transcript}`,
-          },
-        ],
-      });
-      const raw = completion.choices[0]?.message?.content || '';
-      scores = JSON.parse(raw);
-    } catch (gptErr) {
-      console.error('[/api/speaking/submit] GPT scoring error:', gptErr.message);
-      // Non-fatal
+  try {
+    // Determine what to show as the question context
+    const questionLabel   = (question_type   || question_field || '').trim();
+    const questionText    = (question_content || '').trim();
+    const transcriptText  = transcript || '[no speech detected]';
+
+    const userMessage = [
+      `IELTS Speaking Task: ${questionLabel}`,
+      questionText ? `\nQuestion / Cue Card:\n${questionText}` : '',
+      `\nCandidate's Transcript:\n${transcriptText}`,
+    ].join('');
+
+    const completion = await openaiGpt.chat.completions.create({
+      model:       'gpt-4o',
+      temperature: 0.1,   // low temperature for consistent, strict scoring
+      max_tokens:  600,
+      messages: [
+        { role: 'system', content: IELTS_SCORING_SYSTEM },
+        { role: 'user',   content: userMessage },
+      ],
+    });
+
+    const raw = (completion.choices[0]?.message?.content || '').trim();
+
+    // Strip any accidental markdown code fences before parsing
+    const cleaned = raw.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
+    scores = JSON.parse(cleaned);
+
+    // Sanity-check: ensure all required keys exist and values are numeric
+    const requiredKeys = ['overall_band', 'fluency_coherence', 'lexical_resource', 'grammatical_range', 'pronunciation'];
+    for (const k of requiredKeys) {
+      if (typeof scores[k] !== 'number') {
+        scores[k] = null;
+      }
     }
+
+  } catch (gptErr) {
+    console.error('[/api/speaking/submit] GPT scoring error:', gptErr.message);
+    // Non-fatal — scores remain null; frontend shows success without scores
   }
 
   // ── 5. Persist to speaking_submissions ──────────────────
-  const { error: dbError } = await supabase
-    .from('speaking_submissions')
-    .insert({
-      session_id:     session_id.trim(),
-      day:            parsedDay,
-      question_field: question_field.trim(),
-      question_type:  isValidText(question_type, 200) ? question_type.trim() : null,
-      storage_path:   storagePath,
-      transcript:     transcript || null,
-      scores:         scores     || null,
-      prep_time_ms:   Number.isInteger(Number(prep_time_ms))   ? Number(prep_time_ms)   : null,
-      retry_count:    Number.isInteger(Number(retry_count))    ? Number(retry_count)    : null,
-    });
+  const { error: dbError } = await supabase.from('speaking_submissions').insert({
+    session_id:       session_id.trim(),
+    day:              parsedDay,
+    question_field:   question_field.trim(),
+    question_type:    isValidText(question_type, 200)    ? question_type.trim()    : null,
+    question_content: isValidText(question_content, 5000) ? question_content.trim() : null,
+    storage_path:     storagePath,
+    transcript:       transcript  || null,
+    scores:           scores      || null,
+    prep_time_ms:     Number.isFinite(Number(prep_time_ms))  ? Number(prep_time_ms)  : null,
+    retry_count:      Number.isFinite(Number(retry_count))   ? Number(retry_count)   : null,
+  });
 
   if (dbError) {
     console.error('[/api/speaking/submit] DB insert error:', dbError.message);
-    // We already stored the audio; return partial success
+    // Audio is already stored — return partial success
     return res.status(207).json({
       ok:           false,
       warning:      'Audio stored but DB record failed',
@@ -665,16 +621,11 @@ app.post('/api/speaking/submit', upload.single('audio'), async (req, res) => {
     });
   }
 
-  return res.status(201).json({
-    ok:           true,
-    storage_path: storagePath,
-    transcript,
-    scores,
-  });
+  return res.status(201).json({ ok: true, storage_path: storagePath, transcript, scores });
 });
 
 
-// ── Error handler for multer ─────────────────────────────────
+// ── Multer error handler ─────────────────────────────────────
 app.use((err, _req, res, _next) => {
   if (err instanceof multer.MulterError || err.message?.startsWith('Unsupported audio')) {
     return res.status(400).json({ error: err.message });
@@ -685,7 +636,7 @@ app.use((err, _req, res, _next) => {
 
 
 // ============================================================
-// 404 CATCH-ALL  (keep at the very bottom, after all routes)
+// 404 CATCH-ALL  (keep at the very bottom)
 // ============================================================
 app.use((_req, res) => {
   res.status(404).json({ error: 'Not found' });
