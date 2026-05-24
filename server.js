@@ -434,7 +434,7 @@ app.post('/api/sessions', async (req, res) => {
   } : null;
 
   const { error } = await supabase
-    .from('ielts_sessions')
+    .from('sessions')
     .upsert(
       { session_id: session_id.trim(), started_at: started_at || new Date().toISOString(), device_info: safeDeviceInfo },
       { onConflict: 'session_id', ignoreDuplicates: true }
@@ -455,7 +455,7 @@ app.post('/api/events', async (req, res) => {
 
   const safeData = (data && typeof data === 'object' && !Array.isArray(data)) ? data : null;
 
-  const { error } = await supabase.from('ielts_events').insert({
+  const { error } = await supabase.from('events').insert({
     session_id:         session_id.trim(),
     event_name:         event_name.trim(),
     time_in_session_ms: Number.isInteger(time_in_session_ms) ? time_in_session_ms : null,
