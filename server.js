@@ -14,7 +14,7 @@
 // Required environment variables (Railway dashboard):
 //   SUPABASE_URL        — Supabase project URL
 //   SUPABASE_KEY        — service_role key (not anon key)
-//   ALLOWED_ORIGIN      — frontend URL e.g. https://bilimtap.vercel.app
+//   ALLOWED_ORIGIN      — your frontend URL e.g. https://bilimtap.vercel.app
 //   OPENAI_WHISPER_KEY  — OpenAI key for Whisper transcription
 //   OPENAI_GPT_KEY      — OpenAI key for GPT scoring (can be same key)
 //   PORT                — set automatically by Railway
@@ -71,6 +71,9 @@ const app = express();
 
 app.use(helmet());
 
+// Trust Railway's reverse proxy so req.ip returns the real client IP
+app.set('trust proxy', true);
+
 app.use(cors({
   origin: true,
   methods: ['POST', 'GET'],
@@ -85,7 +88,7 @@ app.use((req, _res, next) => {
 
 
 // ============================================================
-// HELPERS — BILIMTAP (original)
+// HELPERS — SHARED
 // ============================================================
 
 function parseDevice(ua = '') {
@@ -117,6 +120,53 @@ function parseOS(ua = '') {
 
 function isValidText(val, max = 500) {
   return typeof val === 'string' && val.trim().length > 0 && val.length <= max;
+}
+
+// ─────────────────────────────────────────────────────────────
+// getClientIp
+// Railway sits behind a reverse proxy. The real client IP is in
+// x-forwarded-for. We take the first (leftmost) address, which
+// is the original client — not the proxy.
+// ─────────────────────────────────────────────────────────────
+function getClientIp(req) {
+  const forwarded = req.headers['x-forwarded-for'];
+  if (forwarded) {
+    return forwarded.split(',')[0].trim();
+  }
+  return req.socket?.remoteAddress || req.ip || null;
+}
+
+// ─────────────────────────────────────────────────────────────
+// geolocateIp
+// Uses ip-api.com free tier (no key required, 45 req/min limit).
+// Returns country, region, city, ISP, org, lat/lon, timezone.
+// Falls back to empty object on any failure — never blocks the
+// session or event from being saved.
+// ─────────────────────────────────────────────────────────────
+async function geolocateIp(ip) {
+  if (!ip || ip === '127.0.0.1' || ip === '::1' || ip.startsWith('192.168') || ip.startsWith('10.')) {
+    return { note: 'local_ip' };
+  }
+  try {
+    const res  = await fetch(`http://ip-api.com/json/${ip}?fields=status,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,org,as,query`);
+    const json = await res.json();
+    if (json.status !== 'success') return {};
+    return {
+      country:      json.country      || null,
+      country_code: json.countryCode  || null,
+      region:       json.regionName   || null,
+      city:         json.city         || null,
+      zip:          json.zip          || null,
+      lat:          json.lat          || null,
+      lon:          json.lon          || null,
+      geo_timezone: json.timezone     || null,
+      isp:          json.isp          || null,
+      org:          json.org          || null,
+      as:           json.as           || null,
+    };
+  } catch (_) {
+    return {};
+  }
 }
 
 const VALID_EVENTS = new Set([
@@ -266,12 +316,12 @@ app.post('/submit', async (req, res) => {
 app.post('/tutor', async (req, res) => {
   const { name, phone, email, profession, experience_years, course_idea, about } = req.body;
 
-  if (!isValidText(name, 200))         return res.status(400).json({ error: 'name is required' });
-  if (!isValidText(phone, 30))         return res.status(400).json({ error: 'phone is required' });
+  if (!isValidText(name, 200))             return res.status(400).json({ error: 'name is required' });
+  if (!isValidText(phone, 30))             return res.status(400).json({ error: 'phone is required' });
   if (!VALID_PROFESSIONS.has(profession))  return res.status(400).json({ error: 'Invalid profession value' });
   if (!VALID_EXPERIENCE.has(experience_years)) return res.status(400).json({ error: 'Invalid experience_years value' });
-  if (!isValidText(course_idea, 500))  return res.status(400).json({ error: 'course_idea is required' });
-  if (!isValidText(about, 2000))       return res.status(400).json({ error: 'about is required' });
+  if (!isValidText(course_idea, 500))      return res.status(400).json({ error: 'course_idea is required' });
+  if (!isValidText(about, 2000))           return res.status(400).json({ error: 'about is required' });
 
   const { error } = await supabase.from('bilimtap_tutor_applications').insert({
     name:             name.trim(),
@@ -321,16 +371,6 @@ const BLOCK_TABLES = {
 
 // ─────────────────────────────────────────────────────────────
 // IELTS SCORING SYSTEM PROMPT
-//
-// FIX: The prompt now:
-//   1. Explicitly instructs GPT to use the provided question
-//      text when evaluating relevance and coherence.
-//   2. Defines what constitutes incoherent / off-topic speech
-//      and mandates low scores for such responses.
-//   3. Anchors all band descriptors to the official IELTS scale
-//      so GPT cannot award inflated scores for poor speech.
-//   4. Requires the examiner_note to state when speech was
-//      incoherent or not addressing the question.
 // ─────────────────────────────────────────────────────────────
 const IELTS_SCORING_SYSTEM = `You are a strict, certified IELTS speaking examiner. Your task is to evaluate a candidate's spoken response that has been transcribed to text.
 
@@ -419,24 +459,83 @@ app.post('/api/answers', async (req, res) => {
 
 
 // ── POST /api/sessions ───────────────────────────────────────
+//
+// CHANGED: now captures the full device_info sent by the client
+// (all 15+ fields) plus the server-side IP address and geo data.
+// Previously the server discarded everything except 6 fields.
+//
 app.post('/api/sessions', async (req, res) => {
   const { session_id, started_at, device_info } = req.body;
 
   if (!isValidText(session_id, 200)) return res.status(400).json({ error: 'session_id is required' });
 
-  const safeDeviceInfo = (device_info && typeof device_info === 'object') ? {
-    userAgent: device_info.userAgent || null,
-    language:  device_info.language  || null,
-    screenW:   device_info.screenW   || null,
-    screenH:   device_info.screenH   || null,
-    timezone:  device_info.timezone  || null,
-    referrer:  device_info.referrer  || null,
-  } : null;
+  // ── Get real client IP ────────────────────────────────────
+  const clientIp = getClientIp(req);
+
+  // ── Geolocate (non-blocking — runs in background) ─────────
+  // We don't await here so the session saves immediately.
+  // Geo data is stored in device_info JSONB alongside client data.
+  const geoPromise = geolocateIp(clientIp);
+
+  // ── Accept ALL fields sent by the client ──────────────────
+  // Previously this whitelist stripped out languages, viewport,
+  // pixelRatio, platform, cookieEnabled, touchSupport, connection
+  // info, and landingUrl. Now we keep everything.
+  const clientData = (device_info && typeof device_info === 'object') ? {
+    // Browser / device
+    userAgent:    device_info.userAgent    || null,
+    language:     device_info.language     || null,
+    languages:    device_info.languages    || null,
+    platform:     device_info.platform     || null,
+    // Parsed from UA on server side for easy querying
+    browser:      parseBrowser(device_info.userAgent || ''),
+    os:           parseOS(device_info.userAgent || ''),
+    device_type:  parseDevice(device_info.userAgent || ''),
+    // Screen & viewport
+    screenW:      device_info.screenW      || null,
+    screenH:      device_info.screenH      || null,
+    viewportW:    device_info.viewportW    || null,
+    viewportH:    device_info.viewportH    || null,
+    pixelRatio:   device_info.pixelRatio   || null,
+    // Capabilities
+    touchSupport: device_info.touchSupport ?? null,
+    cookieEnabled:device_info.cookieEnabled ?? null,
+    online:       device_info.online       ?? null,
+    // Network quality (from Navigator.connection)
+    effectiveType:device_info.effectiveType|| null,
+    downlink:     device_info.downlink     || null,
+    rtt:          device_info.rtt          || null,
+    // Navigation
+    referrer:     device_info.referrer     || null,
+    landingUrl:   device_info.landingUrl   || null,
+    timezone:     device_info.timezone     || null,
+    // Server-side
+    ip:           clientIp,
+  } : { ip: clientIp };
+
+  // ── Wait for geo then save everything together ────────────
+  const geo = await geoPromise;
+  const fullDeviceInfo = { ...clientData, ...geo };
 
   const { error } = await supabase
     .from('sessions')
     .upsert(
-      { session_id: session_id.trim(), started_at: started_at || new Date().toISOString(), device_info: safeDeviceInfo },
+      {
+        session_id:  session_id.trim(),
+        started_at:  started_at || new Date().toISOString(),
+        device_info: fullDeviceInfo,
+        // Also store key fields as top-level columns for easy SQL filtering
+        ip:          clientIp,
+        country:     geo.country      || null,
+        city:        geo.city         || null,
+        browser:     clientData.browser,
+        os:          clientData.os,
+        device_type: clientData.device_type,
+        timezone:    clientData.timezone || geo.geo_timezone || null,
+        referrer:    clientData.referrer || null,
+        landing_url: clientData.landingUrl || null,
+        user_agent:  device_info?.userAgent || null,
+      },
       { onConflict: 'session_id', ignoreDuplicates: true }
     );
 
@@ -447,6 +546,11 @@ app.post('/api/sessions', async (req, res) => {
 
 
 // ── POST /api/events ─────────────────────────────────────────
+//
+// CHANGED: now also captures the server-side IP and user-agent
+// on every event, so you can identify who sent each event even
+// if the session record is missing or from a different browser.
+//
 app.post('/api/events', async (req, res) => {
   const { session_id, event_name, time_in_session_ms, data } = req.body;
 
@@ -460,6 +564,9 @@ app.post('/api/events', async (req, res) => {
     event_name:         event_name.trim(),
     time_in_session_ms: Number.isInteger(time_in_session_ms) ? time_in_session_ms : null,
     data:               safeData,
+    // ADDED: server-side fields captured on every request
+    ip:                 getClientIp(req),
+    user_agent:         req.headers['user-agent'] || null,
   });
 
   if (error) console.error('[POST /api/events]', error.message);
@@ -468,29 +575,8 @@ app.post('/api/events', async (req, res) => {
 
 
 // ── POST /api/speaking/submit ────────────────────────────────
-//
-// Pipeline:
-//   1. Validate multipart fields
-//   2. Upload raw audio to Supabase Storage
-//   3. Transcribe via OpenAI Whisper
-//   4. Score via GPT-4o — using both the question text and the
-//      transcript so evaluation is contextually accurate
-//   5. Persist everything to speaking_submissions
-//   6. Return { ok, transcript, scores, storage_path }
-//
-// Form fields (multipart):
-//   audio            — audio blob           (required)
-//   session_id       — string               (required)
-//   day              — integer              (required)
-//   question_field   — string               (required)
-//   question_type    — string               (optional)
-//   question_content — string               (optional) — the actual exam question text
-//   prep_time_ms     — integer              (optional)
-//   retry_count      — integer              (optional)
-//
 app.post('/api/speaking/submit', upload.single('audio'), async (req, res) => {
 
-  // ── 1. Validate ──────────────────────────────────────────
   if (!req.file) return res.status(400).json({ error: 'audio file is required' });
 
   const {
@@ -498,7 +584,7 @@ app.post('/api/speaking/submit', upload.single('audio'), async (req, res) => {
     day,
     question_field,
     question_type,
-    question_content,  // FIX: the actual exam question text
+    question_content,
     prep_time_ms,
     retry_count,
   } = req.body;
@@ -544,21 +630,14 @@ app.post('/api/speaking/submit', upload.single('audio'), async (req, res) => {
     transcript = (typeof result === 'string' ? result : result.text || '').trim();
   } catch (whisperErr) {
     console.error('[/api/speaking/submit] Whisper error:', whisperErr.message);
-    // Non-fatal — continue with empty transcript
   }
 
   // ── 4. Score with GPT-4o ────────────────────────────────
-  // FIX: Build a user message that includes:
-  //   a) the actual exam question the student was answering
-  //   b) the transcribed speech
-  // This gives GPT the context it needs to judge relevance,
-  // coherence, and band score accurately.
   let scores = null;
   try {
-    // Determine what to show as the question context
-    const questionLabel   = (question_type   || question_field || '').trim();
-    const questionText    = (question_content || '').trim();
-    const transcriptText  = transcript || '[no speech detected]';
+    const questionLabel  = (question_type   || question_field || '').trim();
+    const questionText   = (question_content || '').trim();
+    const transcriptText = transcript || '[no speech detected]';
 
     const userMessage = [
       `IELTS Speaking Task: ${questionLabel}`,
@@ -568,7 +647,7 @@ app.post('/api/speaking/submit', upload.single('audio'), async (req, res) => {
 
     const completion = await openaiGpt.chat.completions.create({
       model:       'gpt-4o',
-      temperature: 0.1,   // low temperature for consistent, strict scoring
+      temperature: 0.1,
       max_tokens:  600,
       messages: [
         { role: 'system', content: IELTS_SCORING_SYSTEM },
@@ -576,23 +655,16 @@ app.post('/api/speaking/submit', upload.single('audio'), async (req, res) => {
       ],
     });
 
-    const raw = (completion.choices[0]?.message?.content || '').trim();
-
-    // Strip any accidental markdown code fences before parsing
+    const raw     = (completion.choices[0]?.message?.content || '').trim();
     const cleaned = raw.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim();
     scores = JSON.parse(cleaned);
 
-    // Sanity-check: ensure all required keys exist and values are numeric
     const requiredKeys = ['overall_band', 'fluency_coherence', 'lexical_resource', 'grammatical_range', 'pronunciation'];
     for (const k of requiredKeys) {
-      if (typeof scores[k] !== 'number') {
-        scores[k] = null;
-      }
+      if (typeof scores[k] !== 'number') scores[k] = null;
     }
-
   } catch (gptErr) {
     console.error('[/api/speaking/submit] GPT scoring error:', gptErr.message);
-    // Non-fatal — scores remain null; frontend shows success without scores
   }
 
   // ── 5. Persist to speaking_submissions ──────────────────
@@ -600,24 +672,20 @@ app.post('/api/speaking/submit', upload.single('audio'), async (req, res) => {
     session_id:       session_id.trim(),
     day:              parsedDay,
     question_field:   question_field.trim(),
-    question_type:    isValidText(question_type, 200)    ? question_type.trim()    : null,
-    question_content: isValidText(question_content, 5000) ? question_content.trim() : null,
+    question_type:    isValidText(question_type, 200)     ? question_type.trim()     : null,
+    question_content: isValidText(question_content, 5000) ? question_content.trim()  : null,
     storage_path:     storagePath,
-    transcript:       transcript  || null,
-    scores:           scores      || null,
-    prep_time_ms:     Number.isFinite(Number(prep_time_ms))  ? Number(prep_time_ms)  : null,
-    retry_count:      Number.isFinite(Number(retry_count))   ? Number(retry_count)   : null,
+    transcript:       transcript || null,
+    scores:           scores     || null,
+    prep_time_ms:     Number.isFinite(Number(prep_time_ms)) ? Number(prep_time_ms) : null,
+    retry_count:      Number.isFinite(Number(retry_count))  ? Number(retry_count)  : null,
   });
 
   if (dbError) {
     console.error('[/api/speaking/submit] DB insert error:', dbError.message);
-    // Audio is already stored — return partial success
     return res.status(207).json({
-      ok:           false,
-      warning:      'Audio stored but DB record failed',
-      storage_path: storagePath,
-      transcript,
-      scores,
+      ok: false, warning: 'Audio stored but DB record failed',
+      storage_path: storagePath, transcript, scores,
     });
   }
 
