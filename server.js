@@ -711,6 +711,97 @@ app.use((_req, res) => {
 });
 
 
+// ============================================================
+// WHATSAPP NOTIFIER
+// Messages are triggered by Supabase pg_cron → POST /api/whatsapp/send
+// The server never self-schedules — safe to restart at any time.
+//
+// First run: scan the QR printed in the terminal with your phone
+// (+420775107507) → WhatsApp → Linked Devices.
+// Session saved to ./.wwebjs_auth — only scanned once.
+// ============================================================
+
+const { Client, LocalAuth } = require('whatsapp-web.js');
+const qrcode = require('qrcode-terminal');
+
+const WA_RECIPIENT = '77051137369@c.us'; // +77051137369 in whatsapp-web.js format
+
+// Secret header so only Supabase cron can trigger sends
+const WA_CRON_SECRET = process.env.WA_CRON_SECRET || 'change-me-in-railway';
+
+const waClient = new Client({
+  authStrategy: new LocalAuth({ dataPath: './.wwebjs_auth' }),
+  puppeteer: {
+    headless: true,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+    ],
+  },
+});
+
+let waReady = false; // guard — don't try to send before client is ready
+
+waClient.on('qr', (qr) => {
+  console.log('\n[WhatsApp] Scan this QR with +420775107507 → Linked Devices:');
+  qrcode.generate(qr, { small: true });
+});
+
+waClient.on('authenticated', () => console.log('[WhatsApp] Authenticated ✓'));
+
+waClient.on('ready', () => {
+  waReady = true;
+  console.log('[WhatsApp] Client ready — waiting for scheduled triggers ✓');
+  // NOTE: we do NOT send anything here, so restarts are safe.
+});
+
+waClient.on('auth_failure', (msg) => {
+  waReady = false;
+  console.error('[WhatsApp] Auth failed — delete .wwebjs_auth and restart:', msg);
+});
+
+waClient.on('disconnected', (reason) => {
+  waReady = false;
+  console.warn('[WhatsApp] Disconnected:', reason);
+});
+
+waClient.initialize();
+
+
+// ── POST /api/whatsapp/send ──────────────────────────────────
+// Called by Supabase pg_cron at scheduled times.
+// Protected by a shared secret in the x-cron-secret header.
+//
+// Body: { "message": "your text" }
+//
+app.post('/api/whatsapp/send', async (req, res) => {
+  // Auth check
+  const secret = req.headers['x-cron-secret'];
+  if (secret !== WA_CRON_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+
+  const { message } = req.body;
+  if (!message || typeof message !== 'string' || !message.trim()) {
+    return res.status(400).json({ error: 'message is required' });
+  }
+
+  if (!waReady) {
+    return res.status(503).json({ error: 'WhatsApp client not ready' });
+  }
+
+  try {
+    await waClient.sendMessage(WA_RECIPIENT, message.trim());
+    console.log(`[WhatsApp] Sent: "${message.trim().slice(0, 60)}…"`);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[WhatsApp] Send failed:', err.message);
+    res.status(500).json({ error: 'Failed to send message' });
+  }
+});
+
+
 // ─── START ───────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log(`[Server] Running on port ${PORT}`);
