@@ -744,8 +744,15 @@ const waClient = new Client({
 let waReady = false; // guard — don't try to send before client is ready
 
 waClient.on('qr', (qr) => {
-  console.log('\n[WhatsApp] Scan this QR with +420775107507 → Linked Devices:');
+  // Terminal version (may be unreadable in Railway logs)
+  console.log('\n[WhatsApp] QR received (terminal version):');
   qrcode.generate(qr, { small: true });
+
+  // Scannable image URL — open this in your browser and scan it
+  const imageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qr)}`;
+  console.log('\n[WhatsApp] ✅ Open this URL in your browser and scan the QR:');
+  console.log(imageUrl);
+  console.log('');
 });
 
 waClient.on('authenticated', () => console.log('[WhatsApp] Authenticated ✓'));
