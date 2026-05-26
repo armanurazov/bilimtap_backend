@@ -702,15 +702,6 @@ app.use((err, _req, res, _next) => {
   res.status(500).json({ error: 'Internal server error' });
 });
 
-
-// ============================================================
-// 404 CATCH-ALL  (keep at the very bottom)
-// ============================================================
-app.use((_req, res) => {
-  res.status(404).json({ error: 'Not found' });
-});
-
-
 // ============================================================
 // WHATSAPP NOTIFIER
 // Messages are triggered by Supabase pg_cron → POST /api/whatsapp/send
@@ -807,6 +798,17 @@ app.post('/api/whatsapp/send', async (req, res) => {
     res.status(500).json({ error: 'Failed to send message' });
   }
 });
+
+
+
+// ============================================================
+// 404 CATCH-ALL  (keep at the very bottom)
+// ============================================================
+app.use((_req, res) => {
+  res.status(404).json({ error: 'Not found' });
+});
+
+
 
 
 // ─── START ───────────────────────────────────────────────────
