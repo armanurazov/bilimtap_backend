@@ -724,6 +724,7 @@ const waClient = new Client({
   authStrategy: new LocalAuth({ dataPath: './.wwebjs_auth' }),
   puppeteer: {
     headless: true,
+    protocolTimeout: 60000, // ← add this line (60 seconds)
     args: [
       '--no-sandbox',
       '--disable-setuid-sandbox',
