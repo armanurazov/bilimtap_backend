@@ -703,79 +703,90 @@ app.use((err, _req, res, _next) => {
 });
 
 // ============================================================
-// WHATSAPP NOTIFIER
-// Messages are triggered by Supabase pg_cron → POST /api/whatsapp/send
-// The server never self-schedules — safe to restart at any time.
-//
-// First run: scan the QR printed in the terminal with your phone
-// (+420775107507) → WhatsApp → Linked Devices.
-// Session saved to ./.wwebjs_auth — only scanned once.
+// WHATSAPP NOTIFIER — powered by Baileys (WebSocket, no Chrome)
+// Triggered by Supabase pg_cron → POST /api/whatsapp/send
+// Session saved to ./.wa_session — persist via Railway Volume
 // ============================================================
 
-const { Client, LocalAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
+const makeWASocket  = require('@whiskeysockets/baileys').default;
+const {
+  useMultiFileAuthState,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+} = require('@whiskeysockets/baileys');
+const { Boom }  = require('@hapi/boom');
+const qrcode    = require('qrcode-terminal');
+const pino      = require('pino');
 
-const WA_RECIPIENT = '77051137369@c.us'; // +77051137369 in whatsapp-web.js format
-
-// Secret header so only Supabase cron can trigger sends
+const WA_RECIPIENT   = '77051137369@s.whatsapp.net'; // Baileys uses @s.whatsapp.net
 const WA_CRON_SECRET = process.env.WA_CRON_SECRET || 'change-me-in-railway';
+const WA_SESSION_DIR = './.wa_session';
 
-const waClient = new Client({
-  authStrategy: new LocalAuth({ dataPath: './.wwebjs_auth' }),
-  puppeteer: {
-    headless: true,
-    protocolTimeout: 60000, // ← add this line (60 seconds)
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-    ],
-  },
+let waSocket = null;
+let waReady  = false;
+
+async function startWhatsApp() {
+  const { state, saveCreds } = await useMultiFileAuthState(WA_SESSION_DIR);
+  const { version }          = await fetchLatestBaileysVersion();
+
+  const sock = makeWASocket({
+    version,
+    auth:   state,
+    logger: pino({ level: 'silent' }), // suppress Baileys internal logs
+    printQRInTerminal: false,           // we handle QR ourselves
+  });
+
+  waSocket = sock;
+
+  // ── QR code ───────────────────────────────────────────
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      console.log('\n[WhatsApp] Scan this QR with +420775107507 → Linked Devices:');
+      qrcode.generate(qr, { small: true });
+      const imageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qr)}`;
+      console.log('[WhatsApp] Or open in browser:', imageUrl);
+    }
+
+    if (connection === 'open') {
+      waReady = true;
+      console.log('[WhatsApp] Connected and ready ✓');
+    }
+
+    if (connection === 'close') {
+      waReady = false;
+      const code     = lastDisconnect?.error;
+      const reason   = new Boom(code)?.output?.statusCode;
+      const loggedOut = reason === DisconnectReason.loggedOut;
+
+      console.warn('[WhatsApp] Disconnected. Reason:', reason);
+
+      if (loggedOut) {
+        console.error('[WhatsApp] Logged out — delete .wa_session and restart to re-scan QR');
+      } else {
+        // Any other disconnect (network blip etc.) — reconnect automatically
+        console.log('[WhatsApp] Reconnecting in 5s…');
+        setTimeout(startWhatsApp, 5000);
+      }
+    }
+  });
+
+  // ── Save credentials whenever they update ────────────
+  sock.ev.on('creds.update', saveCreds);
+}
+
+// Boot WhatsApp on server start
+startWhatsApp().catch((err) => {
+  console.error('[WhatsApp] Failed to start:', err.message);
 });
-
-let waReady = false; // guard — don't try to send before client is ready
-
-waClient.on('qr', (qr) => {
-  // Terminal version (may be unreadable in Railway logs)
-  console.log('\n[WhatsApp] QR received (terminal version):');
-  qrcode.generate(qr, { small: true });
-
-  // Scannable image URL — open this in your browser and scan it
-  const imageUrl = `https://api.qrserver.com/v1/create-qr-code/?size=300x300&data=${encodeURIComponent(qr)}`;
-  console.log('\n[WhatsApp] ✅ Open this URL in your browser and scan the QR:');
-  console.log(imageUrl);
-  console.log('');
-});
-
-waClient.on('authenticated', () => console.log('[WhatsApp] Authenticated ✓'));
-
-waClient.on('ready', () => {
-  waReady = true;
-  console.log('[WhatsApp] Client ready — waiting for scheduled triggers ✓');
-  // NOTE: we do NOT send anything here, so restarts are safe.
-});
-
-waClient.on('auth_failure', (msg) => {
-  waReady = false;
-  console.error('[WhatsApp] Auth failed — delete .wwebjs_auth and restart:', msg);
-});
-
-waClient.on('disconnected', (reason) => {
-  waReady = false;
-  console.warn('[WhatsApp] Disconnected:', reason);
-});
-
-waClient.initialize();
 
 
 // ── POST /api/whatsapp/send ──────────────────────────────────
-// Called by Supabase pg_cron at scheduled times.
-// Protected by a shared secret in the x-cron-secret header.
-//
-// Body: { "message": "your text" }
+// Called by Supabase pg_cron. Protected by x-cron-secret header.
+// Body: { "message": "text" }
 //
 app.post('/api/whatsapp/send', async (req, res) => {
-  // Auth check
   const secret = req.headers['x-cron-secret'];
   if (secret !== WA_CRON_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
@@ -786,17 +797,17 @@ app.post('/api/whatsapp/send', async (req, res) => {
     return res.status(400).json({ error: 'message is required' });
   }
 
-  if (!waReady) {
-    return res.status(503).json({ error: 'WhatsApp client not ready' });
+  if (!waReady || !waSocket) {
+    return res.status(503).json({ error: 'WhatsApp not ready' });
   }
 
   try {
-    await waClient.sendMessage(WA_RECIPIENT, message.trim());
-    console.log(`[WhatsApp] Sent: "${message.trim().slice(0, 60)}…"`);
+    await waSocket.sendMessage(WA_RECIPIENT, { text: message.trim() });
+    console.log(`[WhatsApp] Sent: "${message.trim().slice(0, 60)}"`);
     res.json({ ok: true });
   } catch (err) {
     console.error('[WhatsApp] Send failed:', err.message);
-    res.status(500).json({ error: 'Failed to send message' });
+    res.status(500).json({ error: err.message });
   }
 });
 
