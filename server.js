@@ -801,13 +801,15 @@ app.post('/api/whatsapp/send', async (req, res) => {
     return res.status(503).json({ error: 'WhatsApp not ready' });
   }
 
+  // ✅ Respond immediately so Supabase cron doesn't timeout
+  res.json({ ok: true, queued: true });
+
+  // Send in background after response is already sent
   try {
     await waSocket.sendMessage(WA_RECIPIENT, { text: message.trim() });
     console.log(`[WhatsApp] Sent: "${message.trim().slice(0, 60)}"`);
-    res.json({ ok: true });
   } catch (err) {
     console.error('[WhatsApp] Send failed:', err.message);
-    res.status(500).json({ error: err.message });
   }
 });
 
